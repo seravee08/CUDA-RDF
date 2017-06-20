@@ -1,7 +1,8 @@
 # CUDA-RDF
 A CUDA version random decision forest, provides 10+ times speedups over CPU counterpart.
 
-=============================================
+The CPU version of the RDF is taken from Zhi: https://github.com/czkg/RDF
+
 Compile RDF under Windows
 =============================================
 Dependencies:
@@ -14,7 +15,6 @@ Tools:
 2. CMake 3.7.1
 3. Cygwin
 
-=============================================
 Compile ProtoBuf
 =============================================
 1. Goto the release page and download "protobuf-cpp-3.0.0.zip"
@@ -33,7 +33,6 @@ to build the binaries
 10. You will have two folders $PROTO_ROOT/cmake/build/Release$ and $PROTO_ROOT/cmake/build/Debug$
 in which there are complied binaries
 
-=============================================
 Compile Boost
 =============================================
 1. Unzip the downloaded file and get a folder called "boost_1_62_0" which will be
@@ -44,7 +43,6 @@ referred to as $BOOST_ROOT$ in the remainder of this document
 5. Run >bjam --toolset=msvc-12.0 architecture=x86 address-model=64 stage
 6. The compiled binaries are under $BOOST_ROOT/stage$
 
-=============================================
 Compile RDF
 =============================================
 1. Open Cygwin and change directory to the folder where you extract the RDF codes,
