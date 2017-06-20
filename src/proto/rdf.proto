@@ -1,0 +1,57 @@
+syntax = "proto2";
+package rdf;
+
+message RDFParameter {
+	/////////////////////////////////////////////////////////
+	//for training
+	/////////////////////////////////////////////////////////
+	// number of images
+	optional int32 num_images = 1 [default = 10000];
+	// number of samples for each image
+	optional int32 num_samples = 2 [default = 2000];
+	// number of samples for this label
+	repeated int32 num_pixels = 3;
+
+	// we only support 
+	enum Col {
+		RED = 0;
+		GREEN = 1;
+		BLUE = 2;
+		BLACK = 3;
+		WHITE = 4;
+		YELLOW = 5;
+		PURPLE = 6;
+		AZURE = 7;
+	}
+	// color for this label
+	repeated Col color = 4;
+
+	// number of trees
+	optional int32 num_trees = 5 [default = 10];
+	// depth of each tree
+	optional int32 num_depth = 6 [default = 20];
+	// max span of the window for sampling
+	optional int32 max_span = 7 [default = 200];
+	// size of space of the feature
+	optional int32 space_size = 8 [default = 400];
+	// number of candidate features
+	optional int32 num_features = 9 [default = 2000];
+	// number of candidate thresholds per feature
+	optional int32 num_thresholds = 10 [default = 50];
+	// input path
+	optional string input_path = 11 [default = "./data"];
+	// output path
+	optional string output_path = 12 [default = "./new_data"];
+	// output filename
+	optional string out_name = 13 [default = "./forest.txt"];
+
+	//////////////////////////////////////////////////////////////
+	//for testing
+	//////////////////////////////////////////////////////////////
+	// test input path
+	optional string test_input_path = 14 [default = "./test_data"];
+	// test output path
+	optional string test_output_path = 15 [default = "./test_new_data"];
+	// min probability
+	optional float min_prob = 16 [default = 0.5];
+}
