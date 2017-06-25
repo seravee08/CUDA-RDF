@@ -36,7 +36,7 @@ namespace rdf {
         unsigned int samplePerBin(int binIdx) const;
         void         setSampleCount(const unsigned int& sampleCount);
         void         setBin(int binIdx, const unsigned int& value);    
-		void		 manualSet(size_t* bins, const int& binCount);
+		void		 manualSet(unsigned int* bins, const int& binCount);
 
     private:
         std::vector<unsigned int>   bins_;

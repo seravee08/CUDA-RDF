@@ -3,7 +3,6 @@
 
 #include <npp.h>
 #include <vector>
-#include <random>
 
 #include <rdf/feature.hpp>
 #include <rdf/aggregator.hpp>
@@ -11,6 +10,7 @@
 
 #include <thrust/sort.h>
 #include <thrust/extrema.h>
+#include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 
@@ -50,95 +50,110 @@ class RDF_CU
 {
 public:
 	RDF_CU() {};
-
 	~RDF_CU() {};
 
-	// Function Section
+	// ===== Function Section =====
+
+	// Reset GPU and CPU memory to calculate next tree
+	void cu_reset();
+
+	// Free up all host and device memory after completion
+	void cu_free();
+
+	// Set all utility parameters
 	void setParam(
 		RDF_CU_Param& params_
 		);
 
-	//void cu_init(
-	//	int2*	sample_coords,
-	//	int*	sample_labels,
-	//	int*	sample_depID,
-	//	float4* features
-	//	);
-
-	//void cu_dataTransfer(
-	//	int2*	sample_coords,
-	//	int*	sample_labels,
-	//	int*	sample_depID,
-	//	float4* features
-	//	);
-
-	//void cu_depth_init(
-	//	int		depth_image_num,
-	//	int		width_,
-	//	int		height_,
-	//	float*	depth_array
-	//	);
-
+	// Declare all device and host memory
 	void cu_initialize(
 		);
 
+	// Upload all cpu generated features upto device
+	void cu_featureTransfer(
+		float4 *features_
+		);
+
+	// Control function used to call cu_trainLevel
+	void cu_train(
+		std::vector<rdf::Node>&		nodes
+		);
+
+	// Compute responses in batch mode
+	void compute_responses(
+		std::vector<rdf::Sample>&	samples_per_tree
+		);
+
+	// Upload depth image upto device
 	void cu_depth_const_upload(
 		int		depth_image_num,
 		int		width_,
 		int		height_
 		);
 
-	//void cu_depthTransfer(
-	//	float* depth_array
-	//	);
-
-	void cu_featureTransfer(
-		float4 *features_
+	// Train each level of the current tree
+	void cu_trainLevel(
+		std::vector<int>&			idx,
+		std::vector<int>&			idx_S,
+		std::vector<int>&			idx_E,
+		std::vector<rdf::Node>&		nodes,
+		int							op_nodes,
+		int							recurseDepth
 		);
+
+	// Compute entropy
+	float entropy_compute(
+		unsigned int*				stat,
+		int							boundary
+		);
+
+	// Decide if should terminate the node
+	bool shouldTerminate(
+		float						maxGain,
+		int							recurseDepth
+		);
+
+#ifdef ENABLE_GPU_OBSOLETE
 
 	void cu_curLevel(
-		std::vector<int>&		idx,
-		std::vector<int>&		idx_S,
-		std::vector<int>&		idx_E,
-		int						op_nodes,
-		std::vector<rdf::Node>& nodes,
-		int						recurseDepth
+		std::vector<int>&			idx,
+		std::vector<int>&			idx_S,
+		std::vector<int>&			idx_E,
+		int							op_nodes,
+		std::vector<rdf::Node>&		nodes,
+		int							recurseDepth
 		);
 
-	void cu_trainLevel(
-		std::vector<int>&		idx,
-		std::vector<int>&		idx_S,
-		std::vector<int>&		idx_E,
-		std::vector<rdf::Node>& nodes,
-		int						op_nodes,
-		int						recurseDepth
+	void cu_init(
+		int2*	sample_coords,
+		int*	sample_labels,
+		int*	sample_depID,
+		float4* features
 		);
 
-	float entropy_compute(
-		size_t* stat,
-		int		boundary
+	void cu_dataTransfer(
+		int2*	sample_coords,
+		int*	sample_labels,
+		int*	sample_depID,
+		float4* features
 		);
 
-	bool shouldTerminate(
-		float	maxGain,
-		int		recurseDepth
+	void cu_depth_init(
+		int		depth_image_num,
+		int		width_,
+		int		height_,
+		float*	depth_array
 		);
 
-	void cu_train(
-		std::vector<rdf::Node>& nodes
+	void cu_depthTransfer(
+		float* depth_array
 		);
-
-	void compute_responses(
-		std::vector<rdf::Sample>& samples_per_tree
-		);
-
-	void cu_reset();
-
-	void cu_free();
 
 	void host_free();
 
-	// Data Section
+#endif
+
+	// ===== Data Section =====
 public:
 	// GPU Streams
 	cudaStream_t				execStream;
@@ -151,7 +166,9 @@ public:
 	float*						cu_response_array;
 	float*						cu_thresh;				// Generated thresholds: 1 x featureNum x (thresholdNum_default + 1)
 	float*						cu_gain;				// Gain for each threshold: 1 x featureNum x (thresholdNum_default + 1)
-	size_t*						cu_partitionStatistics;
+	unsigned int*				cu_partitionStatistics;
+	unsigned int*				cu_leftStatistics;
+	unsigned int*				cu_rightStatistics;
 	float4*						cu_features;
 
 	// Batch GPU arrays (two-stream architecture)
@@ -168,7 +185,7 @@ public:
 	thrust::host_vector<int>	host_labels;
 	thrust::host_vector<int>	host_sapID;
 	thrust::host_vector<float>	host_response_array;
-	size_t*						parentStatistics;
+	unsigned int*				parentStatistics;
 
 	// Host Variables
 	int							nodes_size;
@@ -178,19 +195,22 @@ public:
 	RDF_CU_Param				params;
 };
 
-// Device functions
+// ===== Device functions =====
 
+// Query device parameters
 int queryDeviceParams(
 	char* query
 	);
 
+// Check CUDA environment and choose device to operate on
 int createCuContext(
 	bool displayDeviceInfo
 	);
 
+// Destroy CUDA context after completion
 void destroyCuContext();
 
-// Inference functions
+// ===== Inference functions =====
 
 void upload_TreeInfo_Inf(
 	int									numTrees_,

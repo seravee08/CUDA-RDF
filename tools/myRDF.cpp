@@ -403,54 +403,6 @@ int test() {
 		cout << "Storing the forest into shared memory ..." << endl;
 	}
 
-	//for (int ii = 0; ii < numTrees; ii++) {
-	//	for (int jj = 0; jj < forest_CU[ii].size(); jj++) {
-	//		const Node_CU& t = forest_CU[ii][jj];
-
-	//		if (!t.isSplit) {
-
-
-	//			if (ii == 0)
-	//				cout << "Index: " << jj << "  ";
-	//			else {
-	//				int cc_ = 0;
-	//				for (int ff = 0; ff < ii; ff++) {
-	//					cc_ += forest_CU[ff].size();
-	//				}
-
-	//				cout << "Index: " << cc_ + jj << "  ";
-	//			}
-
-
-	//			for (int kk = 0; kk < 4; kk++)
-	//				cout << t.aggregator[kk] << "  ";
-	//			cout << endl;
-
-	//		}
-	//		else {
-
-
-	//			if (ii == 0)
-	//				cout << "Index: " << jj << "  ";
-	//			else {
-	//				int cc_ = 0;
-	//				for (int ff = 0; ff < ii; ff++) {
-	//					cc_ += forest_CU[ff].size();
-	//				}
-
-	//				cout << "Index: " << cc_ + jj << "  ";
-	//			}
-
-	//			cout << t.threshold << endl;
-
-	//		}
-	//	}
-	//}
-	//system("pause");
-
-
-
-
 	// =========================== GPU Branch =============================== //
 #ifdef USE_GPU_INFERENCE
 

@@ -13,8 +13,6 @@
 
 #include "../../build/tools/RDF_CU.cuh"
 
-#define USE_GPU_INFERENCE		// Define to enable GPU inference
-
 namespace rdf{
 	class Forest{
 	public:

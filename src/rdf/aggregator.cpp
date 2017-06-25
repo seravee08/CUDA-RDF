@@ -83,7 +83,7 @@ namespace rdf {
 		sampleCount_ = sampleCount;
 	}
 
-	void Aggregator::manualSet(size_t* bins, const int& binCount) {
+	void Aggregator::manualSet(unsigned int* bins, const int& binCount) {
 		int cntr = 0;
 		binCount_ = binCount;
 		bins_.resize(binCount);

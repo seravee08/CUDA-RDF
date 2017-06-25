@@ -1,4 +1,13 @@
-#include <conio.h>
+// ================================================== //
+// CUDA Random Decision Forest
+// Author: Fan Wang
+// Date: 06/25/2017
+// Note: add desired preprocessor for compilation
+//		 USE_GPU_TRAINING    : for GPU RDF training
+//		 USE_GPU_INFERENCE   : for GPU Inference
+//		 ENABLE_GPU_OBSOLETE : obsolete functions, not tested
+// ================================================== //
+
 #include <windows.h>
 
 #include "RDF_CU.cuh"
@@ -18,6 +27,10 @@
 #define space_log_size 600
 
 #define default_block_X 256
+
+#define block_X_512 512
+
+#define block_X_1024 1024
 
 #define SAMPLE_PER_IMAGE 2000
 
@@ -456,17 +469,21 @@ __global__ void kernel_compute_response_batch(
 	y = (y < 0) ? 0 :
 		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
 
-	curandState state;
-	curand_init(clock(), x_id, 0, &state);
-	if (round(curand_uniform(&state)) == 1)
-	{
-		cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = depth2 - depth;
-	}
-	else
-	{
-		float depth3 = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-		cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = depth2 - depth3;
-	}
+	// ##### The curand causes memory issues ##### //
+	//curandState state;
+	//curand_init(clock(), x_id, 0, &state);
+	//if (round(curand_uniform(&state)) == 1)
+	//{
+	//	cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = depth2 - depth;
+	//}
+	//else
+	//{
+	//	float depth3 = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
+	//	cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = depth2 - depth3;
+	//}
+	// ########################################### //
+
+	cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = depth2 - depth;
 }
 
 __global__ void kernel_compute_response(
@@ -509,64 +526,72 @@ __global__ void kernel_compute_response(
 	y = (y < 0) ? 0 :
 		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
 
-	curandState state;
-	curand_init(clock(), x_id, 0, &state);
-	if (round(curand_uniform(&state)) == 1)
-	{
-		cu_response_array[x_id] = depth2 - depth;
-	}
-	else
-	{
-		float depth3 = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-		cu_response_array[x_id] = depth2 - depth3;
-	}
+	// ##### The curand causes memory issues ##### //
+	//curandState state;
+	//curand_init(clock(), x_id, 0, &state);
+	//if (round(curand_uniform(&state)) == 1)
+	//{
+	//	cu_response_array[x_id] = depth2 - depth;
+	//}
+	//else
+	//{
+	//	float depth3 = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
+	//	cu_response_array[x_id] = depth2 - depth3;
+	//}
+	// ########################################### //
+
+	cu_response_array[x_id] = depth2 - depth;
 }
 
 __global__ void kernel_compute_gain(
-	float*		gain,
-	int*		thresh_num,
-	float		parent_entropy,
-	size_t*		partition_statistics
+	float*				gain,
+	int*				thresh_num,
+	float				parent_entropy,
+	unsigned int*		left_statistics,
+	unsigned int*		right_statistics,
+	unsigned int*		partition_statistics
 	)
 {
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	const int feature_id    = x_id / (CU_Params[0].numTresholds + 1);	// Index of the feature
-	const int thresh_id     = x_id % (CU_Params[0].numTresholds + 1);   // Index of the threshold
-	const int thresh_number = thresh_num[feature_id];					// Retrieve the number of thresholds for this feature
+	// Get the thread index
+	const int x_id = threadIdx.x + blockDim.x * blockIdx.x;
 
 	// Abort thread if the thread is out of boundary
-	if (x_id >= (CU_Params[0].numTresholds + 1) * CU_Params[0].numFeatures || thresh_id >= thresh_number) {
+	if (x_id >= (CU_Params[0].numTresholds + 1) * CU_Params[0].numFeatures) {
+		return;
+	}
+
+	// Calculate the feature and threshold index
+	const int feature_id		= x_id / (CU_Params[0].numTresholds + 1);								 // Index of the feature
+	const int thresh_id			= x_id % (CU_Params[0].numTresholds + 1);								 // Index of the threshold
+	const int thresh_number		= thresh_num[feature_id];												 // Retrieve the number of thresholds for this feature
+	const int feature_offset	= feature_id * (CU_Params[0].numTresholds + 1) * CU_Params[0].numLabels; // Calculate feature offset
+
+	// Abort thread if the threshold exceeds current total number of thresholds
+	if (thresh_id >= thresh_number) {
 		return;
 	}
 
 	unsigned int  left_counter	  = 0;
 	unsigned int  right_counter	  = 0;
-	unsigned int* leftStatistics  = new unsigned int[CU_Params[0].numLabels];   // Histograms for responses lower than current threshold
-	unsigned int* rightStatistics = new unsigned int[CU_Params[0].numLabels];	// Histograms for responses greater than current threshold
-	memset(leftStatistics,  0, CU_Params[0].numLabels * sizeof(unsigned int));	// Set left statitics to empty
-	memset(rightStatistics, 0, CU_Params[0].numLabels * sizeof(unsigned int));	// Set right statistics to empty
-
 	// Aggregate histograms into left and right statistics
 	for (int p = 0; p < thresh_number + 1; p++) {
 		if (p <= thresh_id) {
 			for (int i = 0; i < CU_Params[0].numLabels; i++) {
-				leftStatistics[i] += partition_statistics[
-					feature_id * (CU_Params[0].numTresholds + 1) * CU_Params[0].numLabels + 
-					p * CU_Params[0].numLabels + i];
+				left_statistics[feature_offset + thresh_id * CU_Params[0].numLabels + i] += 
+					partition_statistics[feature_offset + p * CU_Params[0].numLabels + i];
 			}
 		}
 		else {
 			for (int i = 0; i < CU_Params[0].numLabels; i++) {
-				rightStatistics[i] += partition_statistics[
-					feature_id * (CU_Params[0].numTresholds + 1) * CU_Params[0].numLabels +
-					p * CU_Params[0].numLabels + i];
+				right_statistics[feature_offset + thresh_id * CU_Params[0].numLabels + i] += 
+					partition_statistics[feature_offset + p * CU_Params[0].numLabels + i];
 			}
 		}
 	}
 
 	for (int i = 0; i < CU_Params[0].numLabels; i++) {
-		left_counter  += leftStatistics[i];
-		right_counter += rightStatistics[i];
+		left_counter	+= left_statistics[feature_offset + thresh_id * CU_Params[0].numLabels + i];
+		right_counter	+= right_statistics[feature_offset + thresh_id * CU_Params[0].numLabels + i];
 	}
 
 	// Calculate gain for the current threshold
@@ -575,25 +600,20 @@ __global__ void kernel_compute_gain(
 	}
 	else {
 		gain[feature_id * (CU_Params[0].numTresholds + 1) + thresh_id] =
-			parent_entropy -
-			(left_counter * entropy_gain(leftStatistics, left_counter) + right_counter * entropy_gain(rightStatistics, right_counter)) /
-			(left_counter + right_counter);
+			parent_entropy - (left_counter * entropy_gain(&left_statistics[feature_offset + thresh_id * CU_Params[0].numLabels], left_counter)
+			+ right_counter * entropy_gain(&right_statistics[feature_offset + thresh_id * CU_Params[0].numLabels], right_counter) ) / (left_counter + right_counter);
 	}
-
-	//// Clean up memory
-	delete[] leftStatistics;
-	delete[] rightStatistics;
 }
 
 __global__ void kernel_compute_partitionStatistics(
-	float*	response,
-	float*	thresh,
-	int*	labels,
-	int*	thresh_num,
-	int*	sample_ID,
-	int		start_index,
-	int		sample_num,
-	size_t* partition_statistics
+	float*			response,
+	float*			thresh,
+	int*			labels,
+	int*			thresh_num,
+	int*			sample_ID,
+	int				start_index,
+	int				sample_num,
+	unsigned int*	partition_statistics
 	)
 {
 	// Copy number of samples into shared memory
@@ -678,16 +698,6 @@ __global__ void kernel_generate_thresholds(
 
 	// Decide the validity of the thresholds
 	if (thresh[x_id * (numThresholds + 1)] == thresh[x_id * (numThresholds + 1) + thresh_num[x_id]]) {
-
-
-		//if (thresh_num[x_id] == 50) {
-		//	for (int kk = 0; kk < thresh_num[x_id]; kk++) {
-		//		printf("=> %f\n", thresh[x_id * (numThresholds + 1) + kk]);
-		//	}
-		//	printf("=======================================================\n");
-		//}
-
-
 		thresh_num[x_id] = 0;
 		return;
 	}
@@ -716,15 +726,11 @@ void RDF_CU::setParam(RDF_CU_Param& params_)
 	return;
 }
 
-void RDF_CU::host_free() // ** Obsolete function **
-{
-	host_labels.clear();
-	host_sapID.clear();
-	host_response_array.clear();
-}
-
 void RDF_CU::cu_free()
 {
+	// Synchronize device
+	gpuErrchk(cudaDeviceSynchronize());
+
 	// Synchronize cuda streams
 	gpuErrchk(cudaStreamSynchronize(execStream));
 	gpuErrchk(cudaStreamSynchronize(copyStream));
@@ -749,6 +755,8 @@ void RDF_CU::cu_free()
 	gpuErrchk(cudaFree(cu_features));
 	gpuErrchk(cudaFree(cu_response_array));
 	gpuErrchk(cudaFree(cu_partitionStatistics));
+	gpuErrchk(cudaFree(cu_leftStatistics));
+	gpuErrchk(cudaFree(cu_rightStatistics));
 	gpuErrchk(cudaFree(cu_thresh_num));
 	gpuErrchk(cudaFree(cu_thresh));
 	gpuErrchk(cudaFree(cu_gain));
@@ -762,7 +770,7 @@ void RDF_CU::cu_free()
 }
 
 // Compute entropy on the give statistics
-float RDF_CU::entropy_compute(size_t* stat, int boundary)
+float RDF_CU::entropy_compute(unsigned int* stat, int boundary)
 {
 	int cntr = 0;
 	for (int i = 0; i < boundary; i++)
@@ -788,10 +796,12 @@ void RDF_CU::cu_initialize()
 	const int thresh_num_size	= numFeatures * sizeof(int);
 	const int feature_size		= numFeatures * sizeof(float4);
 	const int thresh_size		= (params.numTresholds + 1) * numFeatures * sizeof(float);
-	const int parstat_size		= params.numLabels * (params.numTresholds + 1) * numFeatures * sizeof(size_t);
+	const int parstat_size		= params.numLabels * (params.numTresholds + 1) * numFeatures * sizeof(unsigned int);
 	
 	gpuErrchk(cudaMalloc((void**)&cu_features,				feature_size));
 	gpuErrchk(cudaMalloc((void**)&cu_partitionStatistics,	parstat_size));
+	gpuErrchk(cudaMalloc((void**)&cu_leftStatistics,		parstat_size));
+	gpuErrchk(cudaMalloc((void**)&cu_rightStatistics,		parstat_size));
 	gpuErrchk(cudaMalloc((void**)&cu_thresh_num,			thresh_num_size));
 	gpuErrchk(cudaMalloc((void**)&cu_thresh,				thresh_size));
 	gpuErrchk(cudaMalloc((void**)&cu_gain,					thresh_size));
@@ -822,8 +832,11 @@ void RDF_CU::cu_initialize()
 	gpuErrchk(cudaStreamCreate(&execStream));
 	gpuErrchk(cudaStreamCreate(&copyStream));
 
+	// Synchronize device
+	gpuErrchk(cudaDeviceSynchronize());
+
 	// Declare CPU Memory
-	parentStatistics = new size_t[params.numLabels];
+	parentStatistics = new unsigned int[params.numLabels];
 
 	// Determine the number of nodes in the balanced binary tree
 	nodes_size = (1 << params.maxDepth) - 1;
@@ -881,81 +894,6 @@ void RDF_CU::cu_reset()
 	gpuErrchk(cudaDeviceSynchronize());
 }
 
-//void RDF_CU::cu_init(int2* sample_coords, int* sample_labels, int* sample_depID, float4* features)
-//{
-//	const int numFeatures	= params.numFeatures;
-//	const int samplePerTree = params.sample_per_tree;
-//
-//	int feature_size		= numFeatures * sizeof(float4);
-//	int coords_size			= samplePerTree * sizeof(int2);
-//	int labels_size			= samplePerTree * sizeof(int);
-//	int thresh_num_size		= numFeatures * sizeof(int);
-//	int response_size		= samplePerTree * numFeatures * sizeof(float);
-//	int thresh_size			= (params.numTresholds + 1) * numFeatures * sizeof(float);
-//	int parstat_size		= params.numLabels * (params.numTresholds + 1) * numFeatures * sizeof(size_t);
-//
-//	// Declare CUDA Memory
-//	cudaMalloc((void**)&cu_coords, coords_size);
-//	cudaMalloc((void**)&cu_sapID, labels_size);
-//	cudaMalloc((void**)&cu_labels, labels_size);
-//	cudaMalloc((void**)&cu_depID, labels_size);
-//	cudaMalloc((void**)&cu_features, feature_size);
-//	cudaMalloc((void**)&cu_response_array, response_size);
-//	cudaMalloc((void**)&cu_partitionStatistics, parstat_size);
-//	cudaMalloc((void**)&cu_thresh_num, thresh_num_size);
-//	cudaMalloc((void**)&cu_thresh, thresh_size);
-//	cudaMalloc((void**)&cu_gain, thresh_size);
-//
-//	// Declare CPU Memory
-//	parentStatistics = new size_t[params.numLabels];
-//
-//	// Copy to Constant GPU Memory
-//	// cudaMemcpyToSymbol(CU_Params, &params, sizeof(RDF_CU_Param));
-//
-//	// Copy to GPU Memory
-//	cudaMemcpy(cu_coords, sample_coords, coords_size, cudaMemcpyHostToDevice);
-//	cudaMemcpy(cu_labels, sample_labels, labels_size, cudaMemcpyHostToDevice);
-//	cudaMemcpy(cu_depID, sample_depID, labels_size, cudaMemcpyHostToDevice);
-//	cudaMemcpy(cu_features, features, feature_size, cudaMemcpyHostToDevice);
-//
-//	// Copy to CPU Memory
-//	host_labels = thrust::host_vector<int>(sample_labels, sample_labels + samplePerTree);
-//
-//	// Call CUDA kernel to initialize Sample ID on Device
-//	int blk_sapIDIni = (int)ceil(params.sample_per_tree * 1.0 / default_block_X);
-//	sapID_ini << <blk_sapIDIni, default_block_X >> >(cu_sapID);
-//	gpuErrchk(cudaPeekAtLastError());
-//	gpuErrchk(cudaDeviceSynchronize());
-//
-//	// Initialize Sample ID on Host
-//	host_sapID.reserve(samplePerTree);
-//	for (int i = 0; i < samplePerTree; i++) {
-//		host_sapID[i] = i;
-//	}
-//	nodes_size = (1 << params.maxDepth) - 1;
-//
-//	//CU_MemChecker();
-//}
-
-//void RDF_CU::cu_dataTransfer(int2* sample_coords, int* sample_labels, int* sample_depID, float4* features)
-//{
-//	const int numFeatures	= params.numFeatures;
-//	const int samplePerTree = params.sample_per_tree;
-//
-//	int labels_size		= samplePerTree * sizeof(int);
-//	int coords_size		= samplePerTree * sizeof(int2);
-//	int feature_size	= numFeatures * sizeof(float4);
-//
-//	// Copy to GPU Memory
-//	cudaMemcpy(cu_coords,	sample_coords,	coords_size,	cudaMemcpyHostToDevice);
-//	cudaMemcpy(cu_labels,	sample_labels,	labels_size,	cudaMemcpyHostToDevice);
-//	cudaMemcpy(cu_depID,	sample_depID,	labels_size,	cudaMemcpyHostToDevice);
-//	cudaMemcpy(cu_features, features,		feature_size,	cudaMemcpyHostToDevice);
-//
-//	// Copy to CPU Memory
-//	host_labels = thrust::host_vector<int>(sample_labels, sample_labels + samplePerTree);
-//}
-
 void RDF_CU::cu_depth_const_upload(int depth_image_num, int width_, int height_)
 {
 	// Basic depth information
@@ -972,35 +910,121 @@ void RDF_CU::cu_depth_const_upload(int depth_image_num, int width_, int height_)
 	cudaMemcpyToSymbol(const_UT_Info, host_UT_Info, sizeof(int) * UTInfoCount);
 }
 
-//void RDF_CU::cu_depthTransfer(float* depth_array)
-//{
-//	// Copy depth information into constant memory
-//	int depth_array_size = depth_num * width * height * sizeof(float);
-//	cudaMemcpy(cu_depth_array, depth_array, depth_array_size, cudaMemcpyHostToDevice);
-//}
+#ifdef ENABLE_GPU_OBSOLETE
 
-//void RDF_CU::cu_depth_init(int depth_image_num, int width_, int height_, float* depth_array)
-//{
-//	// Basic depth information
-//	depth_num	= depth_image_num;
-//	width		= width_;
-//	height		= height_;
-//
-//	// Copy depth information into constant memory
-//	int depth_array_size = depth_num * width * height * sizeof(float);
-//	int host_DP_Info[DPInfoCount] = { depth_num, width, height, width * height };
-//	cudaMemcpyToSymbol(const_DP_Info, host_DP_Info, sizeof(int) * DPInfoCount);
-//
-//	// Copy other information into constant memory
-//	int host_UT_Info[UTInfoCount] = { params.sample_per_tree * params.numFeatures };
-//	cudaMemcpyToSymbol(const_UT_Info, host_UT_Info, sizeof(int) * UTInfoCount);
-//
-//	// Allocate memory and copy depth into global memory
-//	cudaMalloc((void**)&cu_depth_array, depth_array_size);
-//	cudaMemcpy(cu_depth_array, depth_array, depth_array_size, cudaMemcpyHostToDevice);
-//
-//	//CU_MemChecker();
-//}
+void RDF_CU::cu_init(int2* sample_coords, int* sample_labels, int* sample_depID, float4* features)
+{
+	const int numFeatures	= params.numFeatures;
+	const int samplePerTree = params.sample_per_tree;
+
+	int feature_size		= numFeatures * sizeof(float4);
+	int coords_size			= samplePerTree * sizeof(int2);
+	int labels_size			= samplePerTree * sizeof(int);
+	int thresh_num_size		= numFeatures * sizeof(int);
+	int response_size		= samplePerTree * numFeatures * sizeof(float);
+	int thresh_size			= (params.numTresholds + 1) * numFeatures * sizeof(float);
+	int parstat_size		= params.numLabels * (params.numTresholds + 1) * numFeatures * sizeof(size_t);
+
+	// Declare CUDA Memory
+	cudaMalloc((void**)&cu_coords, coords_size);
+	cudaMalloc((void**)&cu_sapID, labels_size);
+	cudaMalloc((void**)&cu_labels, labels_size);
+	cudaMalloc((void**)&cu_depID, labels_size);
+	cudaMalloc((void**)&cu_features, feature_size);
+	cudaMalloc((void**)&cu_response_array, response_size);
+	cudaMalloc((void**)&cu_partitionStatistics, parstat_size);
+	cudaMalloc((void**)&cu_thresh_num, thresh_num_size);
+	cudaMalloc((void**)&cu_thresh, thresh_size);
+	cudaMalloc((void**)&cu_gain, thresh_size);
+
+	// Declare CPU Memory
+	parentStatistics = new size_t[params.numLabels];
+
+	// Copy to Constant GPU Memory
+	// cudaMemcpyToSymbol(CU_Params, &params, sizeof(RDF_CU_Param));
+
+	// Copy to GPU Memory
+	cudaMemcpy(cu_coords, sample_coords, coords_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(cu_labels, sample_labels, labels_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(cu_depID, sample_depID, labels_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(cu_features, features, feature_size, cudaMemcpyHostToDevice);
+
+	// Copy to CPU Memory
+	host_labels = thrust::host_vector<int>(sample_labels, sample_labels + samplePerTree);
+
+	// Call CUDA kernel to initialize Sample ID on Device
+	int blk_sapIDIni = (int)ceil(params.sample_per_tree * 1.0 / default_block_X);
+	sapID_ini << <blk_sapIDIni, default_block_X >> >(cu_sapID);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+
+	// Initialize Sample ID on Host
+	host_sapID.reserve(samplePerTree);
+	for (int i = 0; i < samplePerTree; i++) {
+		host_sapID[i] = i;
+	}
+	nodes_size = (1 << params.maxDepth) - 1;
+
+	//CU_MemChecker();
+}
+
+void RDF_CU::cu_dataTransfer(int2* sample_coords, int* sample_labels, int* sample_depID, float4* features)
+{
+	const int numFeatures	= params.numFeatures;
+	const int samplePerTree = params.sample_per_tree;
+
+	int labels_size		= samplePerTree * sizeof(int);
+	int coords_size		= samplePerTree * sizeof(int2);
+	int feature_size	= numFeatures * sizeof(float4);
+
+	// Copy to GPU Memory
+	cudaMemcpy(cu_coords,	sample_coords,	coords_size,	cudaMemcpyHostToDevice);
+	cudaMemcpy(cu_labels,	sample_labels,	labels_size,	cudaMemcpyHostToDevice);
+	cudaMemcpy(cu_depID,	sample_depID,	labels_size,	cudaMemcpyHostToDevice);
+	cudaMemcpy(cu_features, features,		feature_size,	cudaMemcpyHostToDevice);
+
+	// Copy to CPU Memory
+	host_labels = thrust::host_vector<int>(sample_labels, sample_labels + samplePerTree);
+}
+
+void RDF_CU::cu_depthTransfer(float* depth_array)
+{
+	// Copy depth information into constant memory
+	int depth_array_size = depth_num * width * height * sizeof(float);
+	cudaMemcpy(cu_depth_array, depth_array, depth_array_size, cudaMemcpyHostToDevice);
+}
+
+void RDF_CU::cu_depth_init(int depth_image_num, int width_, int height_, float* depth_array)
+{
+	// Basic depth information
+	depth_num	= depth_image_num;
+	width		= width_;
+	height		= height_;
+
+	// Copy depth information into constant memory
+	int depth_array_size = depth_num * width * height * sizeof(float);
+	int host_DP_Info[DPInfoCount] = { depth_num, width, height, width * height };
+	cudaMemcpyToSymbol(const_DP_Info, host_DP_Info, sizeof(int) * DPInfoCount);
+
+	// Copy other information into constant memory
+	int host_UT_Info[UTInfoCount] = { params.sample_per_tree * params.numFeatures };
+	cudaMemcpyToSymbol(const_UT_Info, host_UT_Info, sizeof(int) * UTInfoCount);
+
+	// Allocate memory and copy depth into global memory
+	cudaMalloc((void**)&cu_depth_array, depth_array_size);
+	cudaMemcpy(cu_depth_array, depth_array, depth_array_size, cudaMemcpyHostToDevice);
+
+	//CU_MemChecker();
+}
+
+void RDF_CU::host_free()
+{
+	host_labels.clear();
+	host_sapID.clear();
+	host_response_array.clear();
+}
+
+#endif
 
 void RDF_CU::cu_featureTransfer(float4 *features_)
 {
@@ -1011,29 +1035,6 @@ void RDF_CU::cu_featureTransfer(float4 *features_)
 
 void RDF_CU::compute_responses(std::vector<rdf::Sample>& samples_per_tree)
 {
-	//const int samplePerTree = params.sample_per_tree;
-	//int2* host_coords = new int2[samplePerTree];
-	//cudaMemcpy(host_coords, cu_coords, samplePerTree * sizeof(int2), cudaMemcpyDeviceToHost);
-
-	//float* host_depth = new float[depth_num * width * height];
-	//cudaMemcpy(host_depth, cu_depth_array, depth_num * width * height * sizeof(float), cudaMemcpyDeviceToHost);
-
-	//int* host_depthID = new int[samplePerTree];
-	//cudaMemcpy(host_depthID, cu_depID, samplePerTree * sizeof(int), cudaMemcpyDeviceToHost);
-
-	//int cc = 0;
-	//for (int i = 0; i < samplePerTree; i++)
-	//	if (host_depth[host_depthID[i] * width * height + host_coords[i].y * width + host_coords[i].x] == 1.0)
-	//		cc++;
-	//printf("One : %d\n", cc);
-	//system("pause");
-
-
-
-
-	// Note: cu_coords, cu_depID, cu_depth_array can be collapesed after computing responses
-
-
 	const int numImages			= params.numPerTree;
 	const int samplesPerImage	= params.numSamples;
 	const int totalSamples		= samples_per_tree.size();
@@ -1108,7 +1109,6 @@ void RDF_CU::compute_responses(std::vector<rdf::Sample>& samples_per_tree)
 					cntr++;
 				}
 			}
-
 			assert(cntr == PROCESS_LIMIT * samplesPerImage);
 		}
 		// =============================
@@ -1135,6 +1135,7 @@ void RDF_CU::compute_responses(std::vector<rdf::Sample>& samples_per_tree)
 		// Lanuch response computation kernel
 		if (i > 0) {
 
+			// Call CUDA kernel to calculate responses: FeatureNum x a subset of samples
 			int blkSet_compute_responses_batch = (int)ceil(PROCESS_LIMIT * samplesPerImage * params.numFeatures * 1.0 / default_block_X);
 			kernel_compute_response_batch << <blkSet_compute_responses_batch, default_block_X, 0, execStream >> >(
 				end_index - start_index,
@@ -1155,31 +1156,9 @@ void RDF_CU::compute_responses(std::vector<rdf::Sample>& samples_per_tree)
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 
-
-	//// Call CUDA kernel to calculate responses: FeatureNum x Samples
-	//int blkSet_compute_responses = (int)ceil(params.sample_per_tree * params.numFeatures * 1.0 / default_block_X);
-	//kernel_compute_response << <blkSet_compute_responses, default_block_X >> >(
-	//	cu_coords,
-	//	cu_depID,
-	//	cu_depth_array,
-	//	cu_sapID,
-	//	cu_features,
-	//	cu_response_array
-	//	);
-	//gpuErrchk(cudaPeekAtLastError());
-	//gpuErrchk(cudaDeviceSynchronize());
-
 	// Copy responses from global memory to host memory
 	thrust::device_ptr<float> dev_response_ptr(cu_response_array);
 	host_response_array = thrust::host_vector<float>(dev_response_ptr, dev_response_ptr + params.sample_per_tree * params.numFeatures);
-
-
-	//int cc = 0;
-	//for (int i = 0; i < params.sample_per_tree * params.numFeatures; i++)
-	//	if (host_response_array[i] == 0.0)
-	//		cc++;
-	//printf("Warning: %d\n", cc);
-	//system("pause");
 
 	// Clean up memory
 	delete[] host_depthID;
@@ -1207,10 +1186,6 @@ void RDF_CU::cu_train(std::vector<rdf::Node>& nodes)
 		// Train current level
 		cu_trainLevel(idx, idx_S, idx_E, nodes, idx_S.size(), recurseDepth);
 		recurseDepth++;
-
-		//printf("%d\n", recurseDepth);
-		//for (int i = 0; i < idx_S.size(); i++)
-		//	printf("%d -> %d\n", idx_S[i], idx_E[i]);
 	}
 
 	// ===== Free Memory =====
@@ -1234,34 +1209,18 @@ void RDF_CU::cu_trainLevel(
 	// ===== Calculate array sizes =====
 	int		size_thresh_num  = params.numFeatures * sizeof(int);
 	int		size_thresh		 = (params.numTresholds + 1) * params.numFeatures * sizeof(float);
-	int		size_parstat	 = params.numLabels * (params.numTresholds + 1) * params.numFeatures * sizeof(size_t);
+	int		size_parstat	 = params.numLabels * (params.numTresholds + 1) * params.numFeatures * sizeof(unsigned int);
 
 	for (int i = 0; i < nodesCurrentLevel; i++) {
 
-		// for (int k = 0; k < params.numFeatures; k++)
-		// {
-		//	 for (int j = idx_S[i]; j < idx_E[i]; j++)
-		//	 {
-
-		//		 printf("%f\n", host_response_array[k * params.sample_per_tree + host_sapID[j]]);
-
-		//	 }
-
-		//	 printf("========================================= \n");
-		//	 system("pause");
-		//}
-
-
-
-
-
-
 		// Initialization for current node
-		memset(parentStatistics,			0, params.numLabels * sizeof(size_t));  // Initialize for parent statistics in CPU memory
-		cudaMemset(cu_thresh_num,			0, size_thresh_num);					// Initialize for thresh_num array in GPU
-		cudaMemset(cu_thresh,				0, size_thresh);						// Initialize for thresholds array in GPU
-		cudaMemset(cu_gain,					0, size_thresh);						// Initialize for gain array in GPU		
-		cudaMemset(cu_partitionStatistics,	0, size_parstat);						// Initialize for partition statistics in GPU
+		memset(parentStatistics,			0, params.numLabels * sizeof(unsigned int));	// Initialize for parent statistics in CPU memory
+		cudaMemset(cu_thresh_num,			0, size_thresh_num);							// Initialize for thresh_num array in GPU
+		cudaMemset(cu_thresh,				0, size_thresh);								// Initialize for thresholds array in GPU
+		cudaMemset(cu_gain,					0, size_thresh);								// Initialize for gain array in GPU		
+		cudaMemset(cu_partitionStatistics,	0, size_parstat);								// Initialize for partition statistics in GPU
+		cudaMemset(cu_leftStatistics,		0, size_parstat);								// Initialize for left partition statistics on GPU
+		cudaMemset(cu_rightStatistics,		0, size_parstat);								// Initialize for right partition statistics on GPU
 
 		// Calculate parent statistics
 		float parent_entropy;
@@ -1295,27 +1254,6 @@ void RDF_CU::cu_trainLevel(
 		gpuErrchk(cudaPeekAtLastError());
 		gpuErrchk(cudaDeviceSynchronize());
 
-
-		// Debug: printout thresholds
-		//float* host_thresh = new float[(params.numTresholds + 1) * params.numFeatures];
-		//cudaMemcpy(host_thresh, cu_thresh, (params.numTresholds + 1) * params.numFeatures * sizeof(float), cudaMemcpyDeviceToHost);
-		//for (int k = 0; k < (params.numTresholds + 1) * params.numFeatures; k++)
-		//	printf("%f\n", host_thresh[k]);
-		//system("pause");
-
-
-
-		// Debug: printout threhsolds num
-		//int* host_thresh_num = new int[params.numFeatures];
-		//cudaMemcpy(host_thresh_num, cu_thresh_num, params.numFeatures * sizeof(int), cudaMemcpyDeviceToHost);
-		//for (int k = 0; k < params.numFeatures; k++) {
-		//	printf("%d\n", host_thresh_num[k]);
-		//}
-		//system("pause");
-
-
-
-
 		// Call CUDA kernel to compute histograms across all samples
 		int blkSet_compute_histograms = (int)ceil(params.numFeatures * sample_num * 1.0 / default_block_X);
 		kernel_compute_partitionStatistics << <blkSet_compute_histograms, default_block_X >> >(
@@ -1331,60 +1269,18 @@ void RDF_CU::cu_trainLevel(
 		gpuErrchk(cudaPeekAtLastError());
 		gpuErrchk(cudaDeviceSynchronize());
 
-
-
-		//size_t* host_partitionStatistics = new size_t[params.numLabels * (params.numTresholds + 1) * params.numFeatures];
-		//cudaMemcpy(host_partitionStatistics, cu_partitionStatistics, params.numLabels * (params.numTresholds + 1) * params.numFeatures * sizeof(size_t), cudaMemcpyDeviceToHost);
-		//for (int k = 0; k < params.numFeatures; k++) {
-		//	int tmp = 0;
-		//	for (int kk = 0; kk < (params.numTresholds + 1) * params.numLabels; kk++)
-		//		tmp += host_partitionStatistics[k * params.numLabels * (params.numTresholds + 1) + kk];
-
-		//	if (tmp != sample_num)
-		//		printf("Warning!!!\n");
-		//	else
-		//		printf("Normal\n");
-		//}
-
-
-
-		//size_t* host_partitionStatistics = new size_t[params.numLabels * (params.numTresholds + 1) * params.numFeatures];
-		//cudaMemcpy(host_partitionStatistics, cu_partitionStatistics, params.numLabels * (params.numTresholds + 1) * params.numFeatures * sizeof(size_t), cudaMemcpyDeviceToHost);
-		//for (int k = 0; k < params.numLabels * (params.numTresholds + 1) * params.numFeatures; k++) {
-		//	printf("%d\n", host_partitionStatistics[k]);
-		//}
-
-
-
-
-
-
 		// Call CUDA kernel to compute gain for each of the thresholds
 		int blkSet_compute_gain = (int)ceil(params.numFeatures * (params.numTresholds + 1) * 1.0 / default_block_X);
 		kernel_compute_gain << <blkSet_compute_gain, default_block_X >> > (
 			cu_gain,
 			cu_thresh_num,
 			parent_entropy,
+			cu_leftStatistics,
+			cu_rightStatistics,
 			cu_partitionStatistics
 			);
 		gpuErrchk(cudaPeekAtLastError());
 		gpuErrchk(cudaDeviceSynchronize());
-
-
-
-		// Debug: Print gains
-		//float* gain_tt = new float[params.numFeatures * (params.numTresholds + 1)];
-		//cudaMemcpy(gain_tt, cu_gain, params.numFeatures * (params.numTresholds + 1) * sizeof(float), cudaMemcpyDeviceToHost);
-		//for (int kk = 0; kk < params.numFeatures * (params.numTresholds + 1); kk++)
-		//	printf("%f\n", gain_tt[kk]);
-		//system("pause");
-
-
-
-		//system("pause");
-
-
-
 
 		// Sort the computed gains and find the best feature and best threshold
 		thrust::device_vector<float> thrust_gain(cu_gain, cu_gain + (params.numTresholds + 1) * params.numFeatures);
@@ -1420,41 +1316,38 @@ void RDF_CU::cu_trainLevel(
 			selected_responses.push_back(host_response_array[best_feature_idx * params.sample_per_tree + host_sapID[idx_S[i] + j]]);
 		}
 
+		// ===== Calculate the partition position =====
+		// This partition calculation should give results more similar to CPU version
+		int start_pointer = 0;
+		int end_pointer	  = selected_responses.size() - 1;
 
+		while (start_pointer != end_pointer) {
+			if (selected_responses[start_pointer] >= best_threshold) {\
+				int	  id_swap = host_sapID[idx_S[i] + start_pointer];
+				float key_swap	= selected_responses[start_pointer];
+				
+				// Swap the two responses and indices
+				selected_responses[start_pointer]		= selected_responses[end_pointer];
+				host_sapID[idx_S[i] + start_pointer]	= host_sapID[idx_S[i] + end_pointer];
 
-		int start_tmp = 0;
-		int end_tmp	  = selected_responses.size() - 1;
+				selected_responses[end_pointer]		= key_swap;
+				host_sapID[idx_S[i] + end_pointer]	= id_swap;
 
-		while (start_tmp != end_tmp) {
-
-			if (selected_responses[start_tmp] >= best_threshold) {
-
-				float key_swap = selected_responses[start_tmp];
-				int id_swap = host_sapID[idx_S[i] + start_tmp];
-
-				selected_responses[start_tmp] = selected_responses[end_tmp];
-				host_sapID[idx_S[i] + start_tmp] = host_sapID[idx_S[i] + end_tmp];
-
-				selected_responses[end_tmp] = key_swap;
-				host_sapID[idx_S[i] + end_tmp] = id_swap;
-
-				end_tmp--;
+				end_pointer--;
 			}
 			else {
-				start_tmp++;
+				start_pointer++;
 			}
 		}
 
-		int partition_index = selected_responses[start_tmp] >= best_threshold ? start_tmp : start_tmp + 1;
+		// Determine the parition index
+		int partition_index = selected_responses[start_pointer] >= best_threshold ? start_pointer : start_pointer + 1;
+
+		// Clean the vector
 		selected_responses.clear();
+		// ===============================================================
 
-
-
-
-
-
-
-
+		// ====== Sort the responses: unknown impact on the results =====
 		//thrust::sort_by_key(selected_responses.begin(), selected_responses.end(), &host_sapID[idx_S[i]]);
 
 		//// Determine where to partition the indices
@@ -1467,6 +1360,7 @@ void RDF_CU::cu_trainLevel(
 		//		break;
 		//	}
 		//}
+		// ===============================================================
 
 		// Push partitions
 		idx_Nodes.push_back(idx_node * 2 + 1);
@@ -1475,23 +1369,6 @@ void RDF_CU::cu_trainLevel(
 		idx_Start.push_back(idx_S[i] + partition_index);
 		idx_End.push_back(idx_S[i] + partition_index);
 		idx_End.push_back(idx_E[i]);
-
-
-
-
-
-
-		// Debug: Validation
-		//int cc = 0;
-		//int* host_sapID_t = new int[params.sample_per_tree];
-		//cudaMemcpy(host_sapID_t, cu_sapID, params.sample_per_tree * sizeof(int), cudaMemcpyDeviceToHost);
-		//for (int ii = 0; ii < params.numFeatures; ii++)
-		//	for (int jj = 0; jj < params.sample_per_tree; jj++) {
-		//		if (host_response_array[ii * params.sample_per_tree + host_sapID_t[jj]] == 0.0)
-		//			cc++;
-		//	}
-		//	
-		//printf("Zeros: %d\n", cc);
 	}
 
 	// ===== Current Level Complete =====
@@ -1611,9 +1488,6 @@ __global__ void kernel_inference_ForestInShared(
 	const int y_coord	= (x_id - const_Depth_Info_Inf[2] * depth_idx) / const_Depth_Info_Inf[0];	// Get the row of the sample
 	const int x_coord	= (x_id - const_Depth_Info_Inf[2] * depth_idx) % const_Depth_Info_Inf[0];	// Get the column of the sample
 
-	//if (!(x_coord > 0 && x_coord < 85 && y_coord > 95 && y_coord < 130))
-	//	return;
-
 	// Declare the probability array for the forest
 	float prob[NODE_NUM_LABELS] = { 0 };
 
@@ -1646,15 +1520,19 @@ __global__ void kernel_inference_ForestInShared(
 			y = (y < 0) ? 0 :
 				(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
 
-			float response;
-			curandState state;
-			curand_init(clock(), x_id, 0, &state);
-			if (round(curand_uniform(&state)) == 1) {
-				response = depth2 - depth_local;
-			}
-			else {
-				response = depth2 - depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
-			}
+			// ##### The curand causes memory issues ##### //
+			// float response;
+			//curandState_t state;
+			//curand_init(clock(), x_id, 0, &state);
+			//if (round(curand_uniform(&state)) == 1) {
+			//	response = depth2 - depth_local;
+			//}
+			//else {
+				//response = depth2 - depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
+			//}
+			// ########################################### //
+
+			float response = response = depth2 - depth_local;
 			// ============================
 
 			// Decide which branch to goto
@@ -1719,9 +1597,6 @@ __global__ void kernel_inference_woForestInShared(
 	const int y_coord   = (x_id - const_Depth_Info_Inf[2] * depth_idx) / const_Depth_Info_Inf[0];	// Get the row of the sample
 	const int x_coord   = (x_id - const_Depth_Info_Inf[2] * depth_idx) % const_Depth_Info_Inf[0];	// Get the column of the sample
 
-	//if (!(x_coord > 0 && x_coord < 85 && y_coord > 95 && y_coord < 130))
-	//	return;
-
 	// Declare the probability array for the forest
 	float prob[NODE_NUM_LABELS] = { 0 };
 
@@ -1754,15 +1629,19 @@ __global__ void kernel_inference_woForestInShared(
 			y = (y < 0) ? 0 :
 				(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
 
-			float response;
-			curandState state;
-			curand_init(clock(), x_id, 0, &state);
-			if (round(curand_uniform(&state)) == 1) {
-				response = depth2 - depth_local;
-			}
-			else {
-				response = depth2 - depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
-			}
+			// ##### The curand causes memory issues ##### //
+			//float response;
+			//curandState state;
+			//curand_init(clock(), x_id, 0, &state);
+			//if (round(curand_uniform(&state)) == 1) {
+			//	response = depth2 - depth_local;
+			//}
+			//else {
+			//	response = depth2 - depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
+			//}
+			// ########################################### //
+
+			float response = response = depth2 - depth_local;
 			// ============================
 
 			// Decide which branch to goto
