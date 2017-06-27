@@ -1,3 +1,10 @@
+Update 06/27/2017
+
+The acutal number of samples for each label was adjusted before the random seed was generated.
+As a result, only first N samples for each label was "randomly" chosen. For background label,
+400 samples were sampled only from the first row of the depth image and all of them have depth
+value of 0.0. TODO: Should consider commenting the zero depth handling branch inside the kernel.
+
 Update 06/25/2017
 
 The sources under golden branch is bug free and gives superior performance. Please download
