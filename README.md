@@ -1,5 +1,6 @@
 # CUDA-RDF
-A CUDA version random decision forest, provides 10+ times speedups over CPU counterpart.
+A CUDA version random decision forest, provides roughly 700+ and 750+ times speedups
+for training and inference over CPU counterpart.
 
 The CPU version of the RDF is taken from Zhi: https://github.com/czkg/RDF
 
