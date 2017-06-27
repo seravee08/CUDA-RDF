@@ -11,7 +11,8 @@ The sources under golden branch is bug free and gives superior performance. Plea
 sources from there instead of master branch. It will be merged into master in the future.
 
 # CUDA-RDF
-A CUDA version random decision forest, provides 10+ times speedups over CPU counterpart.
+A CUDA version random decision forest, provides roughly 700+ and 750+ times speedups for training
+and inference respectively over CPU counterpart.
 
 The CPU version of the RDF is taken from Zhi: https://github.com/czkg/RDF
 
