@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <fstream>
 #include <map>
+#include <iomanip>
 
 #include <opencv2/opencv.hpp>
 
@@ -132,10 +133,10 @@ void train_initialize(std::vector<rdf::Sample>& samples,
 	//record each color in mask
 	cv::Mat_<int> mask(labels.size(), 3, 0);
 	for(int i = 0; i < labels.size(); i++) {
-		if(colors[i] == rdf::RDFParameter::RED) {
+		if(colors[i] == rdf::RDFParameter::RED) {			// number 0
 			mask(i, 2) = 255;
 		}
-		else if(colors[i] == rdf::RDFParameter::GREEN) {
+		else if(colors[i] == rdf::RDFParameter::GREEN) {	// number 1
 			mask(i, 1) = 255;
 		}
 		else if(colors[i] == rdf::RDFParameter::BLUE) {
@@ -189,27 +190,39 @@ void train_initialize(std::vector<rdf::Sample>& samples,
 		}
 	}
 
-	// handle the situation that if there are less pixels for this class than defined in proto file
-	for(int i = 0; i < labels.size(); i++) {
-		actual_num[i] = std::min(actual_num[i], labels[i]);
-	}
-
-	int left = numSamples;
-	for(int i = 0; i < labels.size(); i++) {
-		left -= actual_num[i];
-	}
-	if(left < actual_num[labels.size()]) {
-		actual_num[labels.size()] = left;
-	}
-
+	// Note, the random seed is generated before adjusting the number of actual numbers
+	// Added by Fan, 06/27 2017
 	std::random_device rand;
 	std::mt19937 gen(rand());
 	std::vector<std::uniform_int_distribution<> > distribution;
 	distribution.resize(labels.size() + 1);
 
-
 	for(int i = 0; i < labels.size() + 1; i++) {
 		distribution[i] = std::uniform_int_distribution<>(0, actual_num[i] - 1);
+	}
+
+	// handle the situation that if there are less pixels for this class than defined in proto file
+	for (int i = 0; i < labels.size(); i++) {
+		actual_num[i] = std::min(actual_num[i], labels[i]);
+	}
+
+	int left = numSamples;
+	for (int i = 0; i < labels.size(); i++) {
+		left -= actual_num[i];
+	}
+	if (left < actual_num[labels.size()]) {
+		actual_num[labels.size()] = left;
+	}
+
+	// Validate if sample num for each image is 2000
+	int total_sapNum = 0;
+	for (int i = 0; i < labels.size() + 1; i++) {
+		total_sapNum += actual_num[i];
+	}
+
+	if (total_sapNum != SAMPLE_PER_IMAGE) {
+		printf("Sample number per image has to be %d\n", SAMPLE_PER_IMAGE);
+		exit(1);
 	}
 
 	for(int i = 0; i < sampleClass.size(); i++) {
@@ -273,7 +286,7 @@ int train() {
 
 	const int numTrees = rdfParam.num_trees();
 	const int numImages = std::min((int)all_depth_paths.size(), (int)rdfParam.num_images());
-	const int numPerTree = (int)(numImages / numTrees); 
+	const int numPerTree = (int)(numImages / numTrees);
 	const int maxDepth = rdfParam.num_depth();
 	const int numSamples = rdfParam.num_samples();
 	const int numLabels = rdfParam.num_pixels_size();
@@ -389,6 +402,9 @@ int test() {
 	rdf::Forest forest_(numTrees, maxDepth);
 	forest_.readForest(fin, numLabels + 1, forest_CU);
 
+	// =========================== GPU Branch =============================== //
+#ifdef USE_GPU_INFERENCE
+
 	// Automatically determine if to use shared memory based on device settings
 	bool forestInSharedMem = false;
 	int forest_size = 0;
@@ -402,9 +418,6 @@ int test() {
 		forestInSharedMem = true;
 		cout << "Storing the forest into shared memory ..." << endl;
 	}
-
-	// =========================== GPU Branch =============================== //
-#ifdef USE_GPU_INFERENCE
 
 	clock_t inference_start_GPU = clock();
 

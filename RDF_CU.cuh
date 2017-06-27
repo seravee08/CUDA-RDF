@@ -17,7 +17,9 @@
 #include "../../include/rdf/depthImage.hpp"
 #include "../../include/rdf/rgbImage.hpp"
 
-#define NODE_NUM_LABELS 4
+#define NODE_NUM_LABELS 3
+
+#define SAMPLE_PER_IMAGE 2000
 
 typedef struct {
 	// RDF Default Parameters

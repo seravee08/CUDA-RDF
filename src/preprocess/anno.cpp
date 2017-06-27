@@ -2,14 +2,14 @@
 
 
 namespace preprocess{
-	void Anno::setAnno(const std::vector<cv::Vec3f>& joints){
+	void Anno::setAnno(const std::vector<cv::Vec2f>& joints){
 		joints_.resize(joints.size());
-		for(unsigned int idx = 0; idx < joints.size(); ++idx){
+		for (unsigned int idx = 0; idx < joints.size(); ++idx){
 			cv::Mat(joints[idx]).copyTo(joints_[idx]);
 		}
 	}
 
-	std::vector<cv::Vec3f> Anno::getAnno(){
+	std::vector<cv::Vec2f> Anno::getAnno(){
 		return joints_;
 	}
 

@@ -8,14 +8,14 @@
 namespace preprocess{
 	class Anno{
 	public:
-		Anno(){numJoints = 20; joints_.resize(numJoints);}
+		Anno(){ numJoints = 20; joints_.resize(numJoints); }
 		~Anno(){}
-		void setAnno(const std::vector<cv::Vec3f>& joints);
-		std::vector<cv::Vec3f> getAnno();
+		void setAnno(const std::vector<cv::Vec2f>& joints);
+		std::vector<cv::Vec2f> getAnno();
 		void setFileNames(const std::string& id, const std::string& ts);
 		void getFileNames(std::string& id, std::string& ts);
 	private:
-		std::vector<cv::Vec3f> joints_;
+		std::vector<cv::Vec2f> joints_;
 		int numJoints;
 		std::string id_;
 		std::string ts_;

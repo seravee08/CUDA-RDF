@@ -32,8 +32,6 @@
 
 #define block_X_1024 1024
 
-#define SAMPLE_PER_IMAGE 2000
-
 #define PROCESS_LIMIT 3
 
 // #define ENABLE_OLD_KERNELS
@@ -452,6 +450,14 @@ __global__ void kernel_compute_response_batch(
 	float depth = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] +		// Offset to the start of the depth image
 			      cu_coords[sample_id].y * const_DP_Info[1] +					// Offset to the start of the corresponding row
 		          cu_coords[sample_id].x];										// Offset to the exact depth info
+
+	// Handle the case when depth is zero
+	if (depth == 0.0) {
+		cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = -10000.0;
+		return;
+	}
+
+	// Calculate responses
 	float x = cu_features[feature_id].x / depth + cu_coords[sample_id].x;
 	float y = cu_features[feature_id].y / depth + cu_coords[sample_id].y;
 
@@ -509,6 +515,14 @@ __global__ void kernel_compute_response(
 	float depth = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] +			// Offset to the start of the depth image
 				  cu_coords[sample_id].y * const_DP_Info[1] +						// Offset to the start of the corresponding row
 				  cu_coords[sample_id].x];											// Offset to the exact depth info
+
+	// Handle the case when depth is zero
+	if (depth == 0.0) {
+		cu_response_array[x_id] = -10000.0;
+		return;
+	}
+
+	// Calculate responses
 	float x		= cu_features[feature_id].x / depth + cu_coords[sample_id].x;
 	float y		= cu_features[feature_id].y / depth + cu_coords[sample_id].y;
 
@@ -806,7 +820,7 @@ void RDF_CU::cu_initialize()
 	gpuErrchk(cudaMalloc((void**)&cu_thresh,				thresh_size));
 	gpuErrchk(cudaMalloc((void**)&cu_gain,					thresh_size));
 	
-	// Liner GPU memory
+	// Linear GPU memory
 	const int labels_size	= samplePerTree * sizeof(int);
 	const int response_size = samplePerTree * numFeatures * sizeof(float);
 
@@ -1028,8 +1042,7 @@ void RDF_CU::host_free()
 
 void RDF_CU::cu_featureTransfer(float4 *features_)
 {
-	const int numFeatures	= params.numFeatures;
-	int feature_size		= numFeatures * sizeof(float4);
+	const int feature_size = params.numFeatures * sizeof(float4);
 	cudaMemcpy(cu_features, features_, feature_size, cudaMemcpyHostToDevice);
 }
 
@@ -1102,6 +1115,11 @@ void RDF_CU::compute_responses(std::vector<rdf::Sample>& samples_per_tree)
 
 					if (copied_indicator[depthID] != 1) {
 						copied_indicator[depthID] = 1;
+
+						// Check if the dimensions are consistant
+						assert(sample.getDepth().rows == height);
+						assert(sample.getDepth().cols == width);
+
 						worker_array = (float*)sample.getDepth().data;
 						std::memcpy(&host_depth[host_depthID[cntr] * width * height], worker_array, width * height * sizeof(float));
 					}
@@ -1491,6 +1509,19 @@ __global__ void kernel_inference_ForestInShared(
 	// Declare the probability array for the forest
 	float prob[NODE_NUM_LABELS] = { 0 };
 
+	// Initialize the pixel of the output
+	rgb[x_id].x = 0;
+	rgb[x_id].y = 0;
+	rgb[x_id].z = 0;
+
+	// ===== Calculate response =====
+	const float depth_local = depth[x_id];
+
+	// Handle the case when depth is zero
+	if (depth_local == 0.0) {
+		return;
+	}
+
 	// ===== Go through the forest =====
 	for (int i = 0; i < const_numTrees_Inf[0]; i++) {
 		// ===== Go through each tree =====
@@ -1498,9 +1529,7 @@ __global__ void kernel_inference_ForestInShared(
 
 		while (forest_shared[idx].isSplit == 1) {
 
-			// ===== Calculate response =====
-			const float depth_local = depth[x_id];
-
+			// Calculate responses
 			float x = forest_shared[idx].feature.x / depth_local + x_coord;
 			float y = forest_shared[idx].feature.y / depth_local + y_coord;
 
@@ -1511,14 +1540,16 @@ __global__ void kernel_inference_ForestInShared(
 				(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
 
 			float depth2	= depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
-			x				= forest_shared[idx].feature.z / depth_local + x_coord;
-			y				= forest_shared[idx].feature.w / depth_local + y_coord;
 
-			x = (x < 0) ? 0 :
-				(x >= const_Depth_Info_Inf[0]) ? const_Depth_Info_Inf[0] - 1 : x;
-			
-			y = (y < 0) ? 0 :
-				(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
+			// Calculate the response of the second set of offsets, disabled
+			//x				= forest_shared[idx].feature.z / depth_local + x_coord;
+			//y				= forest_shared[idx].feature.w / depth_local + y_coord;
+
+			//x = (x < 0) ? 0 :
+			//	(x >= const_Depth_Info_Inf[0]) ? const_Depth_Info_Inf[0] - 1 : x;
+			//
+			//y = (y < 0) ? 0 :
+			//	(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
 
 			// ##### The curand causes memory issues ##### //
 			// float response;
@@ -1532,7 +1563,7 @@ __global__ void kernel_inference_ForestInShared(
 			//}
 			// ########################################### //
 
-			float response = response = depth2 - depth_local;
+			float response = depth2 - depth_local;
 			// ============================
 
 			// Decide which branch to goto
@@ -1560,11 +1591,6 @@ __global__ void kernel_inference_ForestInShared(
 			prob[j] += forest_shared[idx].aggregator[j] * 1.0 / (sampleCount * const_numTrees_Inf[0]);
 		}
 	}
-
-	// Initialize the pixel of the output
-	rgb[x_id].x = 0;
-	rgb[x_id].y = 0;
-	rgb[x_id].z = 0;
 
 	// Decide the label of the pixel
 	if (prob[const_labelIndex_Inf[0]] > const_minProb_Inf[0]) {
@@ -1600,6 +1626,19 @@ __global__ void kernel_inference_woForestInShared(
 	// Declare the probability array for the forest
 	float prob[NODE_NUM_LABELS] = { 0 };
 
+	// Initialize the pixel of the output
+	rgb[x_id].x = 0;
+	rgb[x_id].y = 0;
+	rgb[x_id].z = 0;
+
+	// ===== Calculate response =====
+	const float depth_local = depth[x_id];
+
+	// Handle the case when depth is zero
+	if (depth_local == 0.0) {
+		return;
+	}
+
 	// ===== Go through the forest =====
 	for (int i = 0; i < const_numTrees_Inf[0]; i++) {
 		// ===== Go through each tree =====
@@ -1607,9 +1646,7 @@ __global__ void kernel_inference_woForestInShared(
 
 		while (forest[idx].isSplit == 1) {
 
-			// ===== Calculate response =====
-			const float depth_local = depth[x_id];
-
+			// Calculate responses
 			float x = forest[idx].feature.x / depth_local + x_coord;
 			float y = forest[idx].feature.y / depth_local + y_coord;
 
@@ -1620,14 +1657,16 @@ __global__ void kernel_inference_woForestInShared(
 				(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
 
 			float depth2 = depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
-			x = forest[idx].feature.z / depth_local + x_coord;
-			y = forest[idx].feature.w / depth_local + y_coord;
 
-			x = (x < 0) ? 0 :
-				(x >= const_Depth_Info_Inf[0]) ? const_Depth_Info_Inf[0] - 1 : x;
+			// Calculate the response of the second set of offsets, disabled
+			//x = forest[idx].feature.z / depth_local + x_coord;
+			//y = forest[idx].feature.w / depth_local + y_coord;
 
-			y = (y < 0) ? 0 :
-				(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
+			//x = (x < 0) ? 0 :
+			//	(x >= const_Depth_Info_Inf[0]) ? const_Depth_Info_Inf[0] - 1 : x;
+
+			//y = (y < 0) ? 0 :
+			//	(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
 
 			// ##### The curand causes memory issues ##### //
 			//float response;
@@ -1641,7 +1680,7 @@ __global__ void kernel_inference_woForestInShared(
 			//}
 			// ########################################### //
 
-			float response = response = depth2 - depth_local;
+			float response = depth2 - depth_local;
 			// ============================
 
 			// Decide which branch to goto
@@ -1669,11 +1708,6 @@ __global__ void kernel_inference_woForestInShared(
 			prob[j] += forest[idx].aggregator[j] * 1.0 / (sampleCount * const_numTrees_Inf[0]);
 		}
 	}
-
-	// Initialize the pixel of the output
-	rgb[x_id].x = 0;
-	rgb[x_id].y = 0;
-	rgb[x_id].z = 0;
 
 	// Decide the label of the pixel
 	if (prob[const_labelIndex_Inf[0]] > const_minProb_Inf[0]) {

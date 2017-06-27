@@ -9,7 +9,12 @@ namespace rdf {
     class Feature {
     public:
         Feature(rdf::LogSpace& space);
-        Feature() {}
+        Feature() {
+			x_  = -1.0;
+			y_  = -1.0;
+			xx_ = -1.0;
+			yy_ = -1.0;
+		}
         ~Feature() {}        
 
         float getX();

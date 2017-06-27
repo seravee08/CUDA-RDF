@@ -73,10 +73,15 @@ namespace rdf {
 
     float Feature::getResponse(const rdf::Sample& sample) const {
         const cv::Point2i point = sample.getCoor();
-        const float depth = sample.getDepth(point.y, point.x);    
+        const float depth = sample.getDepth(point.y, point.x);	
+
+		// ===== In case of depth equal to 0 =====
+		if (depth == 0.0) {
+			return 0.0;
+		}
 
         float x = x_ / depth + point.x;
-        float y = y_ / depth + point.y;    
+        float y = y_ / depth + point.y;
 
         x = (x < 0) ? 0 :
             (x >= sample.getDepth().cols) ? sample.getDepth().cols - 1 : x;    
@@ -93,12 +98,11 @@ namespace rdf {
         yy = (yy < 0) ? 0 :
             (yy >= sample.getDepth().rows) ? sample.getDepth().rows - 1 : yy;
 
-
-        std::random_device rand;
-        std::mt19937 gen(rand());
-        std::uniform_int_distribution<> dis(0, 1);
-
-        int flag = dis(gen);
+		// ===== Generate random seed =====
+		std::random_device rand;
+		std::mt19937 gen(rand());
+		std::uniform_int_distribution<> dis(0, 1);
+		int flag = dis(gen);
 
         if(flag == 1)
             return sample.getDepth(y, x) - depth;
