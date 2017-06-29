@@ -724,6 +724,8 @@ int calculateMeanImage() {
 	preprocess::IO io_;
 	boost::filesystem::path out_file("../mean.exr");
 	io_.writeDepth(out_file, final);
+
+	return 0;
 }
 RegisterBrewFunction(calculateMeanImage)
 

@@ -69,7 +69,6 @@ static BrewFunction GetBrewFunction(const std::string& name) {
 	}
 }
 
-
 void readFiles(rdf::IO& io_, 
 	const std::vector<boost::filesystem::path>& all_depth_paths, 
 	std::vector<rdf::DepthImage>& depth_, 
@@ -81,15 +80,33 @@ void readFiles(rdf::IO& io_,
 	io_.getIdTs(depth_path, id, ts);
 
 	cv::Mat_<float> depth = io_.readDepth(depth_path);
+
+	// ==============================================
+	//for (int i = 0; i < depth.rows; i++) {
+	//	for (int j = 0; j < depth.cols; j++) {
+	//		cout << depth.at<cv::Vec3f>(i, j)[2] << endl;
+	//	}
+	//}
+	//
+	//system("pause");
+	// ==============================================
+
+
 	depth_[idx].setDepth(depth);
 	depth_[idx].setFileNames(id, ts);
 
+	// Modified by Fan 06/28/2017
 	boost::filesystem::path rgb_path = io_.rgbPath(depth_path);
-	if(!boost::filesystem::exists(rgb_path))
-			return;
-	cv::Mat_<cv::Vec3i> rgb = io_.readRGB(rgb_path);
-	rgb_[idx].setRGB(rgb);
-	rgb_[idx].setFileNames(id, ts);
+	if (!boost::filesystem::exists(rgb_path)) {
+		cv::Mat_<cv::Vec3i> rgb(depth.rows, depth.cols);
+		rgb_[idx].setRGB(rgb);
+		rgb_[idx].setFileNames(id, ts);
+	}
+	else {
+		cv::Mat_<cv::Vec3i> rgb = io_.readRGB(rgb_path);
+		rgb_[idx].setRGB(rgb);
+		rgb_[idx].setFileNames(id, ts);
+	}
 }
 
 void readFiles(rdf::IO& io_, 
@@ -115,6 +132,18 @@ void readFiles(rdf::IO& io_,
 	rgb_[idx].setFileNames(id, ts);
 }
 
+void printNotes()
+{
+	std::cout << "========== Notes ==========" << std::endl;
+	std::cout << "It is preferrable to have the number of input images as a multiple of tree in the forest" << std::endl;
+	std::cout << "Tunable parameters: " << endl;
+	std::cout << "Number of trees in the forest  - specified in the \"rdf_param.prototxt\""   << std::endl;
+	std::cout << "Number of candidate features   - specified in the \"rdf_param.prototxt\""   << std::endl;
+	std::cout << "Number of candidate thresholds - specified in the \"rdf_param.prototxt\""   << std::endl;
+	std::cout << "Number of labels               - hardcoded, needs to change in the program" << std::endl;
+	std::cout << "Number of sample per image	 - hardcoded, needs to change in the program" << std::endl;
+	std::cout << "===========================" << std::endl;
+}
 
 void train_initialize(std::vector<rdf::Sample>& samples, 
 	rdf::IO& io_, 

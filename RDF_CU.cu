@@ -1805,6 +1805,10 @@ void control_Inf(
 
 		// Copy input from host to device asynchronzely
 		if (i < inference_number) {
+			// Check the validity of the input depth images
+			assert(depth_vector[i].getDepth().cols == depth_width);
+			assert(depth_vector[i].getDepth().rows == depth_height);
+
 			cudaMemcpyAsync(device_depthArray2, depth_vector[i].getDepth().data, depthArray_size, cudaMemcpyHostToDevice, copyStream);
 		}
 
