@@ -1,10 +1,18 @@
+Update 06/27/2017
+
+The acutal number of samples for each label was adjusted before the random seed was generated.
+As a result, only first N samples for each label was "randomly" chosen. For background label,
+400 samples were sampled only from the first row of the depth image and all of them have depth
+value of 0.0. TODO: Should consider commenting the zero depth handling branch inside the kernel.
+
 Update 06/25/2017
 
 The sources under golden branch is bug free and gives superior performance. Please download
 sources from there instead of master branch. It will be merged into master in the future.
 
 # CUDA-RDF
-A CUDA version random decision forest, provides 10+ times speedups over CPU counterpart.
+A CUDA version random decision forest, provides roughly 700+ and 750+ times speedups for training
+and inference respectively over CPU counterpart.
 
 The CPU version of the RDF is taken from Zhi: https://github.com/czkg/RDF
 
