@@ -79,7 +79,7 @@ cv::Mat_<float> IO::readDepth(boost::filesystem::path& p){
 
 			// =============================
 
-			d = d * 1.3;
+			// d = d * 1.3;
 			if (d < 0 || d > bg_value) {
 				d = bg_value;
 			}

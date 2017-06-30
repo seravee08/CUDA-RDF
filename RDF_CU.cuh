@@ -14,6 +14,10 @@
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 
+#include <boost/format.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/program_options.hpp>
+
 #include "../../include/rdf/depthImage.hpp"
 #include "../../include/rdf/rgbImage.hpp"
 
@@ -48,6 +52,8 @@ typedef struct {
 	int			rightChild;
 } Node_CU;
 
+
+// ===== CUDA-RDF training Class =====
 class RDF_CU
 {
 public:
@@ -197,6 +203,107 @@ public:
 	RDF_CU_Param				params;
 };
 
+// ===== CUDA-RDF inference Class =====
+class CUDA_INFER {
+
+// Functions
+public:
+
+	// Constructor
+	CUDA_INFER(
+		const int							parallel_proc_,
+		const int							depth_width_,
+		const int							depth_height_,
+		const bool							createCUContext_,
+		std::vector<std::vector<Node_CU>>&	forest_,
+		std::string							out_directory_ = ""
+		);
+
+	// Destructor, free both device and host 
+	~CUDA_INFER();
+
+	// Upload depth information into constant memory
+	void upload_DepthInfo_Inf(
+		int width_,
+		int height_
+		);
+
+	// Upload forest informatin to constant device memory
+	// This function has to be called right after the constructor
+	void cu_upload_TreeInfo(
+		int									numLabels_,
+		int									maxDepth_,
+		float								minProb_,
+		std::vector<std::vector<Node_CU>>&	forest_
+		);
+
+	// Determine if to put forest in global memory or shared memory
+	int cu_ifInShared(std::vector<std::vector<Node_CU>>& forest_);
+
+	// Do inference for the frame using the forest
+	cv::Mat_<cv::Vec3i> cu_inferFrame(const cv::Mat_<float>& depth_img);
+
+	// Write out results
+	void writeResult(const cv::Mat_<cv::Vec3i>& result);
+
+	void writeResult(const std::vector<cv::Mat_<cv::Vec3i>>& result);
+
+	// Output last three frames
+	std::vector<cv::Mat_<cv::Vec3i>> flushOutLastThree();
+
+	// Free CPU memory
+	void cu_hostMemFree();
+
+	// Free GPU memory
+	void cu_deviceMemFree();
+
+// Data
+public:
+
+	// Constant information
+	const int				parallel_proc;		// Maximum allowed images processed in parallel
+	const int				depth_width;		// Width of the depth image, should be consistant across images
+	const int				depth_height;		// Height of the depth image, should be consistant across images
+
+	// Constant information for sizes of device arrays
+	const int				depthArray_size;
+	const int				rgbArray_size;
+
+	// Declare input GPU memory
+	float*					device_depthArray1;
+	float*					device_depthArray2;
+	int3*					device_rgbArray1;
+	int3*					device_rgbArray2;
+
+	// Declare output host memory to hold RGB information
+	int3*					host_rgbArray1;
+	int3*					host_rgbArray2;
+
+	// Declare space to hold forest in both host and device
+	Node_CU*				host_forest;
+	Node_CU*				device_forest;
+
+	// Declare temporay address only for address swap purposes
+	float*					device_depthArray_t;
+	int3*					device_rgbArray_t;
+
+	// Declare cuda streams to hide memory copy latency
+	cudaStream_t			execStream;
+	cudaStream_t			copyStream;
+	
+	bool					firstFrame;			// Used for two stream architecture
+	bool					forestInSharedMem;	// Boolean indicating whether the forest in global or shared memory
+	bool					writeOut;			// Used to indicate whether to output results
+	const bool				createCUContext;	// Set ture to create context from inference
+	
+	int						blk_Inference;		// Kernel launch setting parameters
+	int						frame_cntr;			// Internally record the number of frames processed
+	int						forest_size;		// The size of the forest in bytes
+
+	std::string				out_directory;		// Result output directory
+	boost::filesystem::path	out;				// For output purpose
+};
+
 // ===== Device functions =====
 
 // Query device parameters
@@ -211,23 +318,5 @@ int createCuContext(
 
 // Destroy CUDA context after completion
 void destroyCuContext();
-
-// ===== Inference functions =====
-
-void upload_TreeInfo_Inf(
-	int									numTrees_,
-	int									numLabels_,
-	int									maxDepth_,
-	int									labelIndex_,
-	float								minProb_,
-	std::vector<std::vector<Node_CU>>&	forest_
-	);
-
-void control_Inf(
-	std::vector<rdf::DepthImage>&		depth_vector,
-	std::vector<rdf::RGBImage>&			rgb_vecotr,
-	std::vector<std::vector<Node_CU>>&	forest_CU,
-	bool								forestInSharedMem
-	);
 
 #endif

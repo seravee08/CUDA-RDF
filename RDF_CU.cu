@@ -1425,59 +1425,6 @@ __constant__ int	const_totalNode_Inf[1];								// Total number of nodes in the 
 
 __constant__ int	const_treePartition_Inf[TREE_CONTAINER_SIZE + 1];	// Store the ACCUMULATIVE offsets of each starting index
 
-// ================== Utility funtions ==================
-
-void upload_DepthInfo_Inf(
-	int width_,
-	int height_
-	)
-{
-	int host_DepthInfo_Inf[DepthInfoCount_Inf] = { width_, height_, width_ * height_ };
-	cudaMemcpyToSymbol(const_Depth_Info_Inf, host_DepthInfo_Inf, sizeof(int) * DepthInfoCount_Inf);
-}
-
-void upload_TreeInfo_Inf(
-	int									numTrees_,
-	int									numLabels_,
-	int									maxDepth_,
-	int									labelIndex_,
-	float								minProb_,
-	std::vector<std::vector<Node_CU>>&	forest_
-	)
-{
-	assert(forest_.size() == numTrees_);
-
-	// Determine if the input number of trees exceed the partition container limit
-	if (numTrees_ > TREE_CONTAINER_SIZE) {
-		printf("Error: size of tree partition container is hardcoded ...\n");
-		exit(-1);
-	}
-
-	numLabels_ = numLabels_ + 1;
-
-	// Determine if the given number of labels matches the program setting
-	if (numLabels_ != NODE_NUM_LABELS) {
-		printf("Error: the number of labels is hardcoded ...\n");
-		exit(-1);
-	}
-
-	cudaMemcpyToSymbol(const_numTrees_Inf, &numTrees_, sizeof(int));
-	cudaMemcpyToSymbol(const_numLabels_Inf, &numLabels_, sizeof(int));
-	cudaMemcpyToSymbol(const_maxDepth_Inf, &maxDepth_, sizeof(int));
-	cudaMemcpyToSymbol(const_labelIndex_Inf, &labelIndex_, sizeof(int));
-	cudaMemcpyToSymbol(const_minProb_Inf, &minProb_, sizeof(float));
-
-	 // Upload trees partition information to constant memory
-	int host_total_nodeNum = 0;
-	int host_partitionInfo[TREE_CONTAINER_SIZE + 1] = {0};
-	for (int i = 0; i < forest_.size(); i++) {
-		host_partitionInfo[i+1]	= forest_[i].size() + host_partitionInfo[i];
-		host_total_nodeNum		+= forest_[i].size();
-	}
-	cudaMemcpyToSymbol(const_totalNode_Inf, &host_total_nodeNum, sizeof(int));
-	cudaMemcpyToSymbol(const_treePartition_Inf, host_partitionInfo, sizeof(int) * (TREE_CONTAINER_SIZE + 1));
-}
-
 // ================== Inference Kernels with Forest in shared memory ==================
 
 extern __shared__ Node_CU forest_shared[];
@@ -1605,7 +1552,7 @@ __global__ void kernel_inference_ForestInShared(
 
 // ================== Inference Kernels with Forest in global memory ==================
 
-__global__ void kernel_inference_woForestInShared(
+__global__ void kernel_inference_ForestInGlobal(
 	float*		depth,
 	int3*		rgb,
 	Node_CU*	forest,
@@ -1720,107 +1667,218 @@ __global__ void kernel_inference_woForestInShared(
 	}
 }
 
-// ================== Control Functions ==================
-void control_Inf(
-	std::vector<rdf::DepthImage>&		depth_vector,		// Vector containing depth images
-	std::vector<rdf::RGBImage>&			rgb_vector,			// Vector containing rgb images
-	std::vector<std::vector<Node_CU>>&	forest_CU,			// RDF forest loaded
-	bool								forestInSharedMem	// If to put forest inside shared memory
-	)
+CUDA_INFER::CUDA_INFER(
+	const int							parallel_proc_,
+	const int							depth_width_,
+	const int							depth_height_,
+	const bool							createCUContext_,
+	std::vector<std::vector<Node_CU>>&	forest_,
+	std::string							out_directory_
+	) :
+	parallel_proc	(parallel_proc_),
+	depth_width		(depth_width_),
+	depth_height	(depth_height_),
+	createCUContext (createCUContext_),
+	depthArray_size	(parallel_proc_ * depth_width_ * depth_height_ * sizeof(float)),
+	rgbArray_size	(parallel_proc_ * depth_width_ * depth_height_ * sizeof(int3)),
+	out_directory	(out_directory_),
+	firstFrame		(true)
 {
-	assert(depth_vector.size() >= 1);
+	// Create CUDA context for the program
+	if (createCUContext) {
+		createCuContext(false);
+	}
 
-	const int parallel_proc		= 1;								// !!Number of depth processed in parallel!!
-	const int inference_number	= depth_vector.size();				// Number of depth images
-	const int depth_width		= depth_vector[0].getDepth().cols;	// Width of depth image
-	const int depth_height		= depth_vector[0].getDepth().rows;	// Height of depth image
+	// Determine if to put forest in shared memory
+	const int node_num = cu_ifInShared(forest_);
 
 	// Upload depth information to constant memory
-	upload_DepthInfo_Inf(depth_width, depth_height);
+	upload_DepthInfo_Inf(depth_width_, depth_height_);
 
-	// Declare input GPU memory
-	float*	device_depthArray1;
-	float*	device_depthArray2;
-	int3*	device_rgbArray1;
-	int3*	device_rgbArray2;
+	// Calculate the kernel launch parameters
+	blk_Inference = (int)ceil(depth_width_ * depth_height_ * parallel_proc_ * 1.0f / default_block_X);
 
-	// Declare temporary addresses for swap
-	float*	device_depthArray_t;
-	int3*	device_rgbArray_t;
+	frame_cntr = 0;								// Set the frame counter to zero
 
-	// Allocate GPU memory
-	const int depthArray_size	= parallel_proc * depth_width * depth_height * sizeof(float);
-	const int rgbArray_size		= parallel_proc * depth_width * depth_height * sizeof(int3);
-
+	// Allocate device memory
 	gpuErrchk(cudaMalloc(&device_depthArray1, depthArray_size));
 	gpuErrchk(cudaMalloc(&device_depthArray2, depthArray_size));
 	gpuErrchk(cudaMalloc(&device_rgbArray1, rgbArray_size));
 	gpuErrchk(cudaMalloc(&device_rgbArray2, rgbArray_size));
+	gpuErrchk(cudaMalloc(&device_forest, forest_size));
+
+	// Initialize device memory
+	gpuErrchk(cudaMemset(device_depthArray1,	0, depthArray_size));
+	gpuErrchk(cudaMemset(device_depthArray2,	0, depthArray_size));
+	gpuErrchk(cudaMemset(device_rgbArray1,		0, rgbArray_size));
+	gpuErrchk(cudaMemset(device_rgbArray2,		0, rgbArray_size));
 
 	// Create cuda streams
-	cudaStream_t execStream;
-	cudaStream_t copyStream;
-
-	// Initialize streams
 	gpuErrchk(cudaStreamCreate(&execStream));
 	gpuErrchk(cudaStreamCreate(&copyStream));
 
-	// =========================================================================================== //
+	// Allocate the host output array
+	host_rgbArray1 = new int3[depth_width_ * depth_height_];
+	host_rgbArray2 = new int3[depth_width_ * depth_height_];
 
-	// ===== Prepare host forest =====
-	int node_num = 0;
-	for (int i = 0; i < forest_CU.size(); i++) {
-		node_num += forest_CU[i].size();
+	// Initialize host array
+	memset(host_rgbArray1, 0, depth_width_ * depth_height_ * sizeof(int3));
+	memset(host_rgbArray2, 0, depth_width_ * depth_height_ * sizeof(int3));
+
+	// Prepare host forest
+	host_forest = new Node_CU[node_num];
+
+	// Copy forest into host array
+	int cntr = 0;
+	for (int i = 0; i < forest_.size(); i++) {
+		for (int j = 0; j < forest_[i].size(); j++) {
+			host_forest[cntr++] = forest_[i][j];
+		}
 	}
+	assert(cntr == node_num);
 
-	Node_CU* host_forest = new Node_CU[node_num];
+	// Synchronously copy forest into device memory
+	cudaMemcpy(device_forest, host_forest, forest_size, cudaMemcpyHostToDevice);
 
-	node_num = 0;
-	for (int i = 0; i < forest_CU.size(); i++) {
-		for (int j = 0; j < forest_CU[i].size(); j++) {
-			host_forest[node_num++] = forest_CU[i][j];
+	// Decide if to output results
+	(out_directory == "") ? writeOut = false : writeOut = true;
+	if (writeOut) {
+		out = boost::filesystem::path(out_directory);
+		if (!boost::filesystem::exists(out)) {
+			boost::filesystem::create_directory(out);
 		}
 	}
 
-	// ===== Copy forest into device memory =====
-	Node_CU* device_forest;
-	const int forest_size = node_num * sizeof(Node_CU);
-	gpuErrchk(cudaMalloc(&device_forest, forest_size));
-	cudaMemcpy(device_forest, host_forest, forest_size, cudaMemcpyHostToDevice);
+	// Free host forest immediately for performance purpose
+	free(host_forest);
+}
 
-	// ===== Start processing =====
-	int blk_inference = (int)ceil(depth_width * depth_height * parallel_proc * 1.0 / default_block_X);
+CUDA_INFER::~CUDA_INFER()
+{
+	// Free all device memory
+	cu_deviceMemFree();
 
-	cudaMemcpyAsync(device_depthArray2, depth_vector[0].getDepth().data, depthArray_size, cudaMemcpyHostToDevice, copyStream);
+	// Free all host memory
+	cu_hostMemFree();
 
-	for (int i = 1; i < inference_number + 1; i++) {
+	// Reset device
+	if (createCUContext) {
+		destroyCuContext();
+	}
+}
+
+void CUDA_INFER::upload_DepthInfo_Inf(
+	int width_,
+	int height_
+	)
+{
+	int host_DepthInfo_Inf[DepthInfoCount_Inf] = { width_, height_, width_ * height_ };
+	cudaMemcpyToSymbol(const_Depth_Info_Inf, host_DepthInfo_Inf, sizeof(int) * DepthInfoCount_Inf);
+}
+
+void CUDA_INFER::cu_upload_TreeInfo(
+	int									numLabels_,
+	int									maxDepth_,
+	float								minProb_,
+	std::vector<std::vector<Node_CU>>&	forest_
+	)
+{
+	// Assuming forest contains correct number of trees, MIGHT BE RISKY
+	int numTrees_	= forest_.size();
+
+	// Assuming 0 for labelIndex_, MIGHT BE RISKY
+	int	labelIndex_ = 0;
+
+	// Determine if the input number of trees exceed the partition container limit
+	if (numTrees_ > TREE_CONTAINER_SIZE) {
+		printf("Error: size of tree partition container is hardcoded ...\n");
+		exit(-1);
+	}
+
+	numLabels_ = numLabels_ + 1;
+
+	// Determine if the given number of labels matches the program setting
+	if (numLabels_ != NODE_NUM_LABELS) {
+		printf("Error: the number of labels is hardcoded ...\n");
+		exit(-1);
+	}
+
+	cudaMemcpyToSymbol(const_numTrees_Inf, &numTrees_, sizeof(int));
+	cudaMemcpyToSymbol(const_numLabels_Inf, &numLabels_, sizeof(int));
+	cudaMemcpyToSymbol(const_maxDepth_Inf, &maxDepth_, sizeof(int));
+	cudaMemcpyToSymbol(const_labelIndex_Inf, &labelIndex_, sizeof(int));
+	cudaMemcpyToSymbol(const_minProb_Inf, &minProb_, sizeof(float));
+
+	// Upload trees partition information to constant memory
+	int host_total_nodeNum = 0;
+	int host_partitionInfo[TREE_CONTAINER_SIZE + 1] = { 0 };
+	for (int i = 0; i < numTrees_; i++) {
+		host_partitionInfo[i + 1] = forest_[i].size() + host_partitionInfo[i];
+		host_total_nodeNum += forest_[i].size();
+	}
+	cudaMemcpyToSymbol(const_totalNode_Inf, &host_total_nodeNum, sizeof(int));
+	cudaMemcpyToSymbol(const_treePartition_Inf, host_partitionInfo, sizeof(int) * (TREE_CONTAINER_SIZE + 1));
+}
+
+int CUDA_INFER::cu_ifInShared(std::vector<std::vector<Node_CU>>& forest_)
+{
+	// Default value
+	forestInSharedMem = false;
+
+	// Calculate the total number of bytes of the forest
+	int node_num = 0;
+	for (int i = 0; i < forest_.size(); i++) {
+		node_num += forest_[i].size();
+	}
+
+	forest_size = node_num * sizeof(Node_CU);
+
+	// Compare the size of the forst with the maximum allowed size of the shared memory
+	if (forest_size > queryDeviceParams("sharedMemPerBlock") * 0.8) {
+		printf("Forest in global memory ...\n");
+	}
+	else {
+		forestInSharedMem = true;
+		printf("Forest in shared memory ...\n");
+	}
+
+	return node_num;
+}
+
+cv::Mat_<cv::Vec3i> CUDA_INFER::cu_inferFrame(const cv::Mat_<float>& depth_img)
+{
+	// Note: under this architecure, the first three frames are blank
+	// The last three frames need to be flushed out
+
+	// Check the validity of the input depth image
+	assert(depth_image.rows == depth_height);
+	assert(depth_image.cols == depth_width);
+
+	// Decide if this is the first frame
+	if (firstFrame) {
+		// ====== First frame: copy the depth into the buffer and return
+
+		firstFrame = false;
+		cudaMemcpyAsync(device_depthArray2, depth_img.data, depthArray_size, cudaMemcpyHostToDevice, copyStream);
+	}
+	else {
+		// ===== Not first frame: go through regular sequence
 
 		// Synchronize streams
 		gpuErrchk(cudaStreamSynchronize(copyStream));
 		gpuErrchk(cudaStreamSynchronize(execStream));
-		
+
 		// Swap containers
 		SWAP_ADDRESS(device_depthArray1, device_depthArray2, device_depthArray_t);
 		SWAP_ADDRESS(device_rgbArray1, device_rgbArray2, device_rgbArray_t);
+		SWAP_ADDRESS(host_rgbArray1, host_rgbArray2, device_rgbArray_t);
 
-		// Copy input from host to device asynchronzely
-		if (i < inference_number) {
-			// Check the validity of the input depth images
-			assert(depth_vector[i].getDepth().cols == depth_width);
-			assert(depth_vector[i].getDepth().rows == depth_height);
+		// Asynchronisely copy depth into device array
+		cudaMemcpyAsync(device_depthArray2, depth_img.data, depthArray_size, cudaMemcpyHostToDevice, copyStream);
+		cudaMemcpyAsync(host_rgbArray2, device_rgbArray2, rgbArray_size, cudaMemcpyDeviceToHost, copyStream);
 
-			cudaMemcpyAsync(device_depthArray2, depth_vector[i].getDepth().data, depthArray_size, cudaMemcpyHostToDevice, copyStream);
-		}
-
-		// Copy output from device to host asynchronzely
-		if (i - 2 >= 0) {
-			cudaMemcpyAsync(rgb_vector[i - 2].getRGB().data, device_rgbArray2, rgbArray_size, cudaMemcpyDeviceToHost, copyStream);
-		}
-
-		// ===== Launch Inference Kernels =====
 		if (forestInSharedMem) {
-
-			kernel_inference_ForestInShared << <blk_inference, default_block_X, forest_size, execStream >> >(
+			kernel_inference_ForestInShared << <blk_Inference, default_block_X, forest_size, execStream >> > (
 				device_depthArray1,
 				device_rgbArray1,
 				device_forest,
@@ -1828,7 +1886,7 @@ void control_Inf(
 				);
 		}
 		else {
-			kernel_inference_woForestInShared << <blk_inference, default_block_X, 0, execStream >> >(
+			kernel_inference_ForestInGlobal << <blk_Inference, default_block_X, 0, execStream >> > (
 				device_depthArray1,
 				device_rgbArray1,
 				device_forest,
@@ -1837,18 +1895,108 @@ void control_Inf(
 		}
 	}
 
-	gpuErrchk(cudaStreamSynchronize(copyStream));
-	gpuErrchk(cudaStreamSynchronize(execStream));
-	SWAP_ADDRESS(device_rgbArray1, device_rgbArray2, device_rgbArray_t);
-	cudaMemcpy(rgb_vector[inference_number - 1].getRGB().data, device_rgbArray2, rgbArray_size, cudaMemcpyDeviceToHost);
+	// Copy the array into a mat strucutre
+	cv::Mat_<cv::Vec3i> result(depth_height, depth_width, (cv::Vec3i*)host_rgbArray1);
 
-	// Check for CUDA errors
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	// Output results
+	if (writeOut) {
+		writeResult(result);
+	}
 
-	// =========================================================================================== //
+	// Increase frame counter by 1
+	frame_cntr++;
 
-	// Synchronize cuda streams
+	// Return the rgb result
+	return result;
+}
+
+std::vector<cv::Mat_<cv::Vec3i>> CUDA_INFER::flushOutLastThree()
+{
+	// Vectors to contain last three frames
+	std::vector<cv::Mat_<cv::Vec3i>> last3Frame(3);
+
+	for (int i = 0; i < 3; i++) {
+
+		// Synchronize streams
+		gpuErrchk(cudaStreamSynchronize(copyStream));
+		gpuErrchk(cudaStreamSynchronize(execStream));
+
+		// Swap containers
+		SWAP_ADDRESS(device_depthArray1, device_depthArray2, device_depthArray_t);
+		SWAP_ADDRESS(device_rgbArray1, device_rgbArray2, device_rgbArray_t);
+		SWAP_ADDRESS(host_rgbArray1, host_rgbArray2, device_rgbArray_t);
+
+		// Asynchronisely copy result out to host array
+		cudaMemcpyAsync(host_rgbArray2, device_rgbArray2, rgbArray_size, cudaMemcpyDeviceToHost, copyStream);
+
+		if (i == 0) {
+			if (forestInSharedMem) {
+				kernel_inference_ForestInShared << <blk_Inference, default_block_X, forest_size, execStream >> > (
+					device_depthArray1,
+					device_rgbArray1,
+					device_forest,
+					parallel_proc
+					);
+			}
+			else {
+				kernel_inference_ForestInGlobal << <blk_Inference, default_block_X, 0, execStream >> > (
+					device_depthArray1,
+					device_rgbArray1,
+					device_forest,
+					parallel_proc
+					);
+			}
+		}
+
+		// Copy the array into a mat strucutre
+		cv::Mat_<cv::Vec3i> result(depth_height, depth_width, (cv::Vec3i*)host_rgbArray1);
+		last3Frame[i] = result;
+	}
+
+	if (writeOut) {
+		writeResult(last3Frame);
+	}
+
+	return last3Frame;
+}
+
+void CUDA_INFER::writeResult(const cv::Mat_<cv::Vec3i>& result)
+{
+	// First frames are blank
+	if (frame_cntr < 3) {
+		return;
+	}
+
+	// Assemble names
+	boost::format fmt_result_rgb("%s_result_rgb.png");
+	boost::filesystem::path out_rgb = out / (fmt_result_rgb % std::to_string(frame_cntr - 3)).str();
+
+	// Write out results
+	cv::imwrite(out_rgb.string(), result);
+}
+
+void CUDA_INFER::writeResult(const std::vector<cv::Mat_<cv::Vec3i>>& result)
+{
+	for (int i = 0; i < 3; i++) {
+		// Assemble names
+		boost::format fmt_result_rgb("%s_result_rgb.png");
+		boost::filesystem::path out_rgb = out / (fmt_result_rgb % std::to_string(frame_cntr - (3 - i))).str();
+
+		// Write out results
+		cv::imwrite(out_rgb.string(), result[i]);
+	}
+}
+
+void CUDA_INFER::cu_hostMemFree()
+{
+	// Free all host memory
+	free(host_rgbArray1);
+	free(host_rgbArray2);
+}
+
+void CUDA_INFER::cu_deviceMemFree()
+{
+	// Synchornize cuda streams
 	gpuErrchk(cudaStreamSynchronize(execStream));
 	gpuErrchk(cudaStreamSynchronize(copyStream));
 
@@ -1856,13 +2004,10 @@ void control_Inf(
 	gpuErrchk(cudaStreamDestroy(execStream));
 	gpuErrchk(cudaStreamDestroy(copyStream));
 
-	// Clean up GPU memory
+	// Clean up device memory
 	gpuErrchk(cudaFree(device_depthArray1));
 	gpuErrchk(cudaFree(device_depthArray2));
 	gpuErrchk(cudaFree(device_rgbArray1));
 	gpuErrchk(cudaFree(device_rgbArray2));
 	gpuErrchk(cudaFree(device_forest));
-
-	// Clean up CPU memory
-	free(host_forest);
 }

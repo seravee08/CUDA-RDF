@@ -434,49 +434,25 @@ int test() {
 	// =========================== GPU Branch =============================== //
 #ifdef USE_GPU_INFERENCE
 
-	// Automatically determine if to use shared memory based on device settings
-	bool forestInSharedMem = false;
-	int forest_size = 0;
-	for (int i = 0; i < numTrees; i++) {
-		forest_size += forest_CU[i].size() * sizeof(Node_CU);
-	}
-	if (forest_size > queryDeviceParams("sharedMemPerBlock") * 0.8) {
-		cout << "Storing the forest into global memory ..." << endl;
-	}
-	else {
-		forestInSharedMem = true;
-		cout << "Storing the forest into shared memory ..." << endl;
-	}
-
 	clock_t inference_start_GPU = clock();
 
-	// Collect information for GPU
-	upload_TreeInfo_Inf(numTrees, numLabels, maxDepth, labelIndex, min_prob, forest_CU);
+	// ===== GPU Inference =====
+	CUDA_INFER cu_infer(1, depth_[0].getDepth().cols, depth_[0].getDepth().rows, true, forest_CU, rdfParam.test_output_path());
+	cu_infer.cu_upload_TreeInfo(numLabels, maxDepth, min_prob, forest_CU);
 
-	// Call CUDA functions to do inference
-	control_Inf(depth_, rgb_, forest_CU, forestInSharedMem);
+	for (int i = 0; i < depth_.size(); i++) {
+		cu_infer.cu_inferFrame(depth_[i].getDepth());
+	}
+
+	// Optional
+	cu_infer.flushOutLastThree();
+	// =========================
 
 	// Calculate elapsed time
 	clock_t inference_end_GPU = clock();
 	float time_elapsed_GPU = (float)(inference_end_GPU - inference_start_GPU) / CLOCKS_PER_SEC;
 	printf("GPU inference time: %f\n", time_elapsed_GPU);
 	printf("Writing out results ...\n");
-
-	// Output results
-	std::string ou = rdfParam.test_output_path();
-	boost::filesystem::path out(ou);
-	if (!boost::filesystem::exists(out)){
-		boost::filesystem::create_directory(out);
-	}
-
-	for (int idx = 0; idx < num; idx++) {
-		const cv::Mat_<cv::Vec3i>& result_rgb = rgb_[idx].getRGB();
-		std::string id, ts;
-		rgb_[idx].getFileNames(id, ts);
-		boost::format fmt_result_rgb("%s_%s_result_rgb.png");
-		boost::filesystem::path out_rgb = out / (fmt_result_rgb % id % ts).str();
-		io_.writeRGB(out_rgb, result_rgb);
-	}
 
 #else
 
@@ -582,10 +558,10 @@ int main(int argc, char** argv){
 	//	std::cout << "Should have at least one option!" << std::endl;
 	//}
 
-	createCuContext(false);
+	//createCuContext(false);
 	// train();
 	test();
-	destroyCuContext();
+	//destroyCuContext();
 
 	system("pause");
 
