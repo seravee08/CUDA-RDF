@@ -1673,6 +1673,7 @@ CUDA_INFER::CUDA_INFER(
 	const int							depth_height_,
 	const bool							createCUContext_,
 	std::vector<std::vector<Node_CU>>&	forest_,
+	const bool							realTime_,
 	std::string							out_directory_
 	) :
 	parallel_proc	(parallel_proc_),
@@ -1682,6 +1683,7 @@ CUDA_INFER::CUDA_INFER(
 	depthArray_size	(parallel_proc_ * depth_width_ * depth_height_ * sizeof(float)),
 	rgbArray_size	(parallel_proc_ * depth_width_ * depth_height_ * sizeof(int3)),
 	out_directory	(out_directory_),
+	realTime		(realTime_),
 	firstFrame		(true)
 {
 	// Create CUDA context for the program
@@ -1702,29 +1704,39 @@ CUDA_INFER::CUDA_INFER(
 
 	// Allocate device memory
 	gpuErrchk(cudaMalloc(&device_depthArray1, depthArray_size));
-	gpuErrchk(cudaMalloc(&device_depthArray2, depthArray_size));
 	gpuErrchk(cudaMalloc(&device_rgbArray1, rgbArray_size));
-	gpuErrchk(cudaMalloc(&device_rgbArray2, rgbArray_size));
 	gpuErrchk(cudaMalloc(&device_forest, forest_size));
 
 	// Initialize device memory
-	gpuErrchk(cudaMemset(device_depthArray1,	0, depthArray_size));
-	gpuErrchk(cudaMemset(device_depthArray2,	0, depthArray_size));
-	gpuErrchk(cudaMemset(device_rgbArray1,		0, rgbArray_size));
-	gpuErrchk(cudaMemset(device_rgbArray2,		0, rgbArray_size));
-
-	// Create cuda streams
-	gpuErrchk(cudaStreamCreate(&execStream));
-	gpuErrchk(cudaStreamCreate(&copyStream));
+	gpuErrchk(cudaMemset(device_depthArray1, 0, depthArray_size));
+	gpuErrchk(cudaMemset(device_rgbArray1, 0, rgbArray_size));
 
 	// Allocate the host output array
 	host_rgbArray1 = new int3[depth_width_ * depth_height_];
-	host_rgbArray2 = new int3[depth_width_ * depth_height_];
 
 	// Initialize host array
 	memset(host_rgbArray1, 0, depth_width_ * depth_height_ * sizeof(int3));
-	memset(host_rgbArray2, 0, depth_width_ * depth_height_ * sizeof(int3));
 
+	if (!realTime) {
+		// Allocate device memory
+		gpuErrchk(cudaMalloc(&device_depthArray2, depthArray_size));
+		gpuErrchk(cudaMalloc(&device_rgbArray2, rgbArray_size));
+
+		// Initialize device memory
+		gpuErrchk(cudaMemset(device_depthArray2, 0, depthArray_size));
+		gpuErrchk(cudaMemset(device_rgbArray2, 0, rgbArray_size));
+
+		// Create cuda streams
+		gpuErrchk(cudaStreamCreate(&execStream));
+		gpuErrchk(cudaStreamCreate(&copyStream));
+
+		// Allocate the host output array
+		host_rgbArray2 = new int3[depth_width_ * depth_height_];
+
+		// Initialize host array
+		memset(host_rgbArray2, 0, depth_width_ * depth_height_ * sizeof(int3));
+	}
+	
 	// Prepare host forest
 	host_forest = new Node_CU[node_num];
 
@@ -1741,7 +1753,7 @@ CUDA_INFER::CUDA_INFER(
 	cudaMemcpy(device_forest, host_forest, forest_size, cudaMemcpyHostToDevice);
 
 	// Decide if to output results
-	(out_directory == "") ? writeOut = false : writeOut = true;
+	writeOut = (out_directory == "") ? false : true;
 	if (writeOut) {
 		out = boost::filesystem::path(out_directory);
 		if (!boost::filesystem::exists(out)) {
@@ -1845,10 +1857,17 @@ int CUDA_INFER::cu_ifInShared(std::vector<std::vector<Node_CU>>& forest_)
 	return node_num;
 }
 
+// Infer frame function for batch mode
 cv::Mat_<cv::Vec3i> CUDA_INFER::cu_inferFrame(const cv::Mat_<float>& depth_img)
 {
 	// Note: under this architecure, the first three frames are blank
 	// The last three frames need to be flushed out
+
+	// Check if this is the right function to call
+	if (realTime) {
+		printf("Call \"cu_inferFrame_hard\" instead ...\n");
+		exit(1);
+	}
 
 	// Check the validity of the input depth image
 	assert(depth_image.rows == depth_height);
@@ -1910,8 +1929,70 @@ cv::Mat_<cv::Vec3i> CUDA_INFER::cu_inferFrame(const cv::Mat_<float>& depth_img)
 	return result;
 }
 
+// Infer frame function for real time
+cv::Mat_<cv::Vec3i> CUDA_INFER::cu_inferFrame_hard(const cv::Mat_<float>& depth_img)
+{
+	// Check if this is the right function to call
+	if (!realTime) {
+		printf("Call \"cu_inferFrame\" instead ...\n");
+		exit(1);
+	}
+
+	// Check the validity of the input depth image
+	assert(depth_image.rows == depth_height);
+	assert(depth_image.cols == depth_width);
+
+	// Copy depth from host to device
+	cudaMemcpy(device_depthArray1, depth_img.data, depthArray_size, cudaMemcpyHostToDevice);
+
+	// Launch kernel to compute inference
+	if (forestInSharedMem) {
+		kernel_inference_ForestInShared << <blk_Inference, default_block_X, forest_size >> > (
+			device_depthArray1,
+			device_rgbArray1,
+			device_forest,
+			parallel_proc
+			);
+	}
+	else {
+		kernel_inference_ForestInGlobal << <blk_Inference, default_block_X, 0 >> > (
+			device_depthArray1,
+			device_rgbArray1,
+			device_forest,
+			parallel_proc
+			);
+	}
+
+	// Check for kernel errors
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+
+	// Copy rgb from device to host
+	cudaMemcpy(host_rgbArray1, device_rgbArray1, depthArray_size, cudaMemcpyDeviceToHost);
+
+	// Copy the array into a mat structure
+	cv::Mat_<cv::Vec3i> result(depth_height, depth_width, (cv::Vec3i*)host_rgbArray1);
+
+	// Output results
+	if (writeOut) {
+		writeResult(result);
+	}
+
+	// Increase frame counter by one
+	frame_cntr++;
+
+	// Return the rgb result
+	return result;
+}
+
 std::vector<cv::Mat_<cv::Vec3i>> CUDA_INFER::flushOutLastThree()
 {
+	// Check if it is necessary to use this function
+	if (realTime) {
+		printf("Use this function in batch mode only ...\n");
+		exit(1);
+	}
+
 	// Vectors to contain last three frames
 	std::vector<cv::Mat_<cv::Vec3i>> last3Frame(3);
 
@@ -1962,14 +2043,26 @@ std::vector<cv::Mat_<cv::Vec3i>> CUDA_INFER::flushOutLastThree()
 
 void CUDA_INFER::writeResult(const cv::Mat_<cv::Vec3i>& result)
 {
-	// First frames are blank
-	if (frame_cntr < 3) {
-		return;
+	boost::format fmt_result_rgb("%s_result_rgb.png");
+	boost::filesystem::path out_rgb;
+
+	// For real time output, no three frame lag
+	if (!realTime) {
+
+		// First frames are blank
+		if (frame_cntr < 3) {
+			return;
+		}
+
+		// Assemble names
+		out_rgb = out / (fmt_result_rgb % std::to_string(frame_cntr - 3)).str();
 	}
 
-	// Assemble names
-	boost::format fmt_result_rgb("%s_result_rgb.png");
-	boost::filesystem::path out_rgb = out / (fmt_result_rgb % std::to_string(frame_cntr - 3)).str();
+	// For batch outputs, three frames lag but better performance
+	else {
+
+		out_rgb = out / (fmt_result_rgb % std::to_string(frame_cntr)).str();
+	}
 
 	// Write out results
 	cv::imwrite(out_rgb.string(), result);
@@ -1991,23 +2084,30 @@ void CUDA_INFER::cu_hostMemFree()
 {
 	// Free all host memory
 	free(host_rgbArray1);
-	free(host_rgbArray2);
+
+	if (!realTime) {
+		free(host_rgbArray2);
+	}
 }
 
 void CUDA_INFER::cu_deviceMemFree()
 {
-	// Synchornize cuda streams
-	gpuErrchk(cudaStreamSynchronize(execStream));
-	gpuErrchk(cudaStreamSynchronize(copyStream));
+	if (!realTime) {
+		// Synchornize cuda streams
+		gpuErrchk(cudaStreamSynchronize(execStream));
+		gpuErrchk(cudaStreamSynchronize(copyStream));
 
-	// Destroy cuda streams
-	gpuErrchk(cudaStreamDestroy(execStream));
-	gpuErrchk(cudaStreamDestroy(copyStream));
+		// Destroy cuda streams
+		gpuErrchk(cudaStreamDestroy(execStream));
+		gpuErrchk(cudaStreamDestroy(copyStream));
+
+		// Clean up device memory
+		gpuErrchk(cudaFree(device_depthArray2));
+		gpuErrchk(cudaFree(device_rgbArray2));
+	}
 
 	// Clean up device memory
 	gpuErrchk(cudaFree(device_depthArray1));
-	gpuErrchk(cudaFree(device_depthArray2));
 	gpuErrchk(cudaFree(device_rgbArray1));
-	gpuErrchk(cudaFree(device_rgbArray2));
 	gpuErrchk(cudaFree(device_forest));
 }

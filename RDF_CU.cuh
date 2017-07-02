@@ -216,6 +216,7 @@ public:
 		const int							depth_height_,
 		const bool							createCUContext_,
 		std::vector<std::vector<Node_CU>>&	forest_,
+		const bool							realTime_ = false,
 		std::string							out_directory_ = ""
 		);
 
@@ -242,6 +243,9 @@ public:
 
 	// Do inference for the frame using the forest
 	cv::Mat_<cv::Vec3i> cu_inferFrame(const cv::Mat_<float>& depth_img);
+
+	// Do inference for the frame without buffers, low performance warning
+	cv::Mat_<cv::Vec3i> cu_inferFrame_hard(const cv::Mat_<float>& depth_img);
 
 	// Write out results
 	void writeResult(const cv::Mat_<cv::Vec3i>& result);
@@ -294,6 +298,7 @@ public:
 	bool					firstFrame;			// Used for two stream architecture
 	bool					forestInSharedMem;	// Boolean indicating whether the forest in global or shared memory
 	bool					writeOut;			// Used to indicate whether to output results
+	const bool				realTime;			// Process the frame in real time, low performance warning!
 	const bool				createCUContext;	// Set ture to create context from inference
 	
 	int						blk_Inference;		// Kernel launch setting parameters

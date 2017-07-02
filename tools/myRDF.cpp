@@ -437,15 +437,15 @@ int test() {
 	clock_t inference_start_GPU = clock();
 
 	// ===== GPU Inference =====
-	CUDA_INFER cu_infer(1, depth_[0].getDepth().cols, depth_[0].getDepth().rows, true, forest_CU, rdfParam.test_output_path());
+	CUDA_INFER cu_infer(1, depth_[0].getDepth().cols, depth_[0].getDepth().rows, true, forest_CU, true, rdfParam.test_output_path());
 	cu_infer.cu_upload_TreeInfo(numLabels, maxDepth, min_prob, forest_CU);
 
 	for (int i = 0; i < depth_.size(); i++) {
-		cu_infer.cu_inferFrame(depth_[i].getDepth());
+		cu_infer.cu_inferFrame_hard(depth_[i].getDepth());
 	}
 
 	// Optional
-	cu_infer.flushOutLastThree();
+	// cu_infer.flushOutLastThree();
 	// =========================
 
 	// Calculate elapsed time
@@ -558,10 +558,10 @@ int main(int argc, char** argv){
 	//	std::cout << "Should have at least one option!" << std::endl;
 	//}
 
-	//createCuContext(false);
-	// train();
-	test();
-	//destroyCuContext();
+	createCuContext(false);
+	train();
+	// test();
+	destroyCuContext();
 
 	system("pause");
 
