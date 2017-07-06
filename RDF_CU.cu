@@ -8,21 +8,16 @@
 //		 ENABLE_GPU_OBSOLETE : obsolete functions, not tested
 // ================================================== //
 
-#include <windows.h>
-
 #include "RDF_CU.cuh"
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
-#include <curand.h>
-#include <curand_kernel.h>
+#include <boost/format.hpp>
+#include <boost/program_options.hpp>
+
 #include <time.h>
 
 #define Thres 0.01
-
-#define DPInfoCount 4
-
-#define UTInfoCount 1
 
 #define space_log_size 600
 
@@ -32,19 +27,11 @@
 
 #define block_X_1024 1024
 
-#define PROCESS_LIMIT 3
-
 // #define ENABLE_OLD_KERNELS
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 
 #define SWAP_ADDRESS(a, b, t) t = (a); a = (b); b = (t)
-
-__constant__ RDF_CU_Param CU_Params[1];
-
-__constant__ int const_DP_Info[DPInfoCount];
-
-__constant__ int const_UT_Info[UTInfoCount];
 
 cudaDeviceProp inExecution_DeviceProp;
 
@@ -178,569 +165,92 @@ void destroyCuContext()
 // ============================================= TRAINING =========================================================
 // ================================================================================================================
 
-
-// ======================================== Utility Kernels ===========================================
-
-__global__ void sapID_ini(int* sap_ID)
-{
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= CU_Params[0].sample_per_tree)
-	{
-		return;
-	}
-
-	sap_ID[x_id] = x_id;
-}
-
-__device__ float entropy_gain(unsigned int* stat, unsigned int cntr)
-{
-	if (cntr == 0)
-	{
-		return 0.0;
-	}
-
-	float res = 0.0;
-	for (int b = 0; b < CU_Params[0].numLabels; b++)
-	{
-		float p = stat[b] * 1.0 / cntr;
-		res -= (p == 0.0) ? 0.0 : p * logf(p) / logf(2.0);
-	}
-	return res;
-}
-
-// ========================================= Old Kernels ================================================
-
-#ifdef ENABLE_OLD_KERNELS
-
-__global__ void bstResp_gen(int2* cu_coords, float4 bst_feat, int* cu_depID, int* cu_sapID, float* cu_depth_array,
-	float* cu_response_array, int sap_num, float thresh_bst, int* partiPos)
-{
-	__shared__ float4 bstFeat[1];
-	if (threadIdx.x == 0)
-		bstFeat[0] = bst_feat;
-	__syncthreads();
-
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= sap_num)
-	{
-		return;
-	}
-
-	float depth = cu_depth_array[cu_depID[cu_sapID[x_id]] * const_DP_Info[3] + cu_coords[cu_sapID[x_id]].y * const_DP_Info[1] + cu_coords[cu_sapID[x_id]].x];
-	float x = bstFeat[0].w / depth + cu_coords[cu_sapID[x_id]].x;
-	float y = bstFeat[0].x / depth + cu_coords[cu_sapID[x_id]].y;
-
-	x = (x < 0) ? 0 :
-		(x >= const_DP_Info[1]) ? const_DP_Info[1] - 1 : x;
-	y = (y < 0) ? 0 :
-		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
-
-	float depth_new = cu_depth_array[cu_depID[cu_sapID[x_id]] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-
-	x = bstFeat[0].y / depth + cu_coords[cu_sapID[x_id]].x;
-	y = bstFeat[0].z / depth + cu_coords[cu_sapID[x_id]].y;
-
-	x = (x < 0) ? 0 :
-		(x >= const_DP_Info[1]) ? const_DP_Info[1] - 1 : x;
-	y = (y < 0) ? 0 :
-		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
-
-	curandState state;
-	curand_init(clock(), x_id, 0, &state);
-	if (round(curand_uniform(&state)) == 1)
-		cu_response_array[x_id] = depth_new - depth;
-	else
-		cu_response_array[x_id] = depth_new - cu_depth_array[cu_depID[cu_sapID[x_id]] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-
-	if (cu_response_array[x_id] < thresh_bst)
-		atomicAdd(partiPos, 1);
-}
-
-__global__ void response_gen(int2* cu_coords, float4* cu_features, int* cu_depID, float* cu_depth_array,
-	float* cu_response_array, int* sap_ID, int* sec_num, int* sec_cntr, int* idxS, int nodesCurrentLevel)
-{
-	__shared__ int sh[1];
-	if (threadIdx.x == 0)
-		sh[0] = nodesCurrentLevel;
-	__syncthreads();
-	// response_array: sap1 sap2 ... sap1 sap2
-	int id_sec, id_offset;
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	for (id_sec = 0; id_sec < sh[0]; id_sec++)
-		if (x_id < sec_num[id_sec])
-			break;
-	if (id_sec >= sh[0])
-		return;
-	id_offset = x_id;
-	if (id_sec >= 1)
-		id_offset -= sec_num[id_sec - 1];
-
-	int sap_id = idxS[id_sec] + id_offset % sec_cntr[id_sec];
-	int fea_id = id_offset / sec_cntr[id_sec];
-	float depth = cu_depth_array[cu_depID[sap_ID[sap_id]] * const_DP_Info[3] + cu_coords[sap_ID[sap_id]].y * const_DP_Info[1] + cu_coords[sap_ID[sap_id]].x];
-	float x = cu_features[id_sec * CU_Params[0].numFeatures + fea_id].w / depth + cu_coords[sap_ID[sap_id]].x;
-	float y = cu_features[id_sec * CU_Params[0].numFeatures + fea_id].x / depth + cu_coords[sap_ID[sap_id]].y;
-
-	x = (x < 0) ? 0 :
-		(x >= const_DP_Info[1]) ? const_DP_Info[1] - 1 : x;
-	y = (y < 0) ? 0 :
-		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
-
-	float depth_new = cu_depth_array[cu_depID[sap_ID[sap_id]] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-
-	x = cu_features[id_sec * CU_Params[0].numFeatures + fea_id].y / depth + cu_coords[sap_ID[sap_id]].x;
-	y = cu_features[id_sec * CU_Params[0].numFeatures + fea_id].z / depth + cu_coords[sap_ID[sap_id]].y;
-
-	x = (x < 0) ? 0 :
-		(x >= const_DP_Info[1]) ? const_DP_Info[1] - 1 : x;
-	y = (y < 0) ? 0 :
-		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
-
-	curandState state;
-	curand_init(clock(), x_id, 0, &state);
-	if (round(curand_uniform(&state)) == 1)
-		cu_response_array[x_id] = depth_new - depth;
-	else
-		cu_response_array[x_id] = depth_new - cu_depth_array[cu_depID[sap_ID[sap_id]] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-}
-
-__global__ void gain_gen(float* gain, size_t* par_stat, int thresh_num, float par_entropy)
-{
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= thresh_num)
-	{
-		return;
-	}
-
-	unsigned int cntr_l = 0, cntr_r  = 0;
-	unsigned int* leftStat  = new unsigned int[CU_Params[0].numLabels];
-	unsigned int* rightStat = new unsigned int[CU_Params[0].numLabels];
-	memset(leftStat,  0, CU_Params[0].numLabels * sizeof(unsigned int));
-	memset(rightStat, 0, CU_Params[0].numLabels * sizeof(unsigned int));
-
-	for (int p = 0; p < thresh_num + 1; p++)
-	{
-		if (p <= x_id)
-			for (int i = 0; i < CU_Params[0].numLabels; i++)
-				leftStat[i] += par_stat[p * CU_Params[0].numLabels + i];
-		else
-			for (int i = 0; i < CU_Params[0].numLabels; i++)
-				rightStat[i] += par_stat[p * CU_Params[0].numLabels + i];
-	}
-	for (int i = 0; i < CU_Params[0].numLabels; i++)
-	{
-		cntr_l += leftStat[i];
-		cntr_r += rightStat[i];
-	}
-
-	if ((cntr_l + cntr_r) <= 1)
-		gain[x_id] = 0.0;
-	else
-		gain[x_id] = par_entropy - (cntr_l * entropy_gain(leftStat, cntr_l) + cntr_r * entropy_gain(rightStat, cntr_r)) / (cntr_l + cntr_r);
-
-	delete[] leftStat;
-	delete[] rightStat;
-}
-
-__global__ void parstat_gen(float* response_array, int* labs, int* sap_ID, int sap_num, int thresh_num, float* thresh, size_t* par_stat)
-{
-	__shared__ int sh[1];
-	if (threadIdx.x == 0)
-		sh[0] = thresh_num;
-	__syncthreads();
-
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= sap_num)
-	{
-		return;
-	}
-
-	int b = 0;
-	while (b < sh[0] && response_array[x_id] >= thresh[b])
-		b++;
-	atomicAdd(&par_stat[b * CU_Params[0].numLabels + labs[sap_ID[x_id]]], 1);
-}
-
-__global__ void thresholds_gen(float* cu_response_array, int sap_num, int* labs, int* thresh_num, int* sap_ID, float* thresh, float* gain, size_t* parstat, float par_entropy)
-{
-	__shared__ int sh[1];
-	if (threadIdx.x == 0)
-		sh[0] = sap_num;
-	__syncthreads();
-
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= CU_Params[0].numFeatures)
-	{
-		return;
-	}
-
-	curandState state;
-	curand_init(clock(), x_id, 0, &state);
-	if (sh[0] > CU_Params[0].numTresholds)
-	{
-		thresh_num[x_id] = CU_Params[0].numTresholds;
-		for (int i = 0; i < CU_Params[0].numTresholds + 1; i++)
-		{
-			int randIdx = round(curand_uniform(&state) * (sh[0] - 1));
-			thresh[x_id * (CU_Params[0].numTresholds + 1) + i] = cu_response_array[x_id *sh[0] + randIdx];
-		}
-	}
-	else
-	{
-		thresh_num[x_id] = sh[0] - 1;
-		for (int i = 0; i < sh[0]; i++)
-			thresh[x_id * (CU_Params[0].numTresholds + 1) + i] = cu_response_array[x_id *sh[0] + i];
-	}
-
-	thrust::sort(thrust::seq, &thresh[x_id * (CU_Params[0].numTresholds + 1)], &thresh[x_id * (CU_Params[0].numTresholds + 1)] + thresh_num[x_id] + 1);
-	if (thresh[x_id * (CU_Params[0].numTresholds + 1)] == thresh[x_id * (CU_Params[0].numTresholds + 1) + thresh_num[x_id]])
-	{
-		thresh_num[x_id] = 0;
-		return;
-	}
-
-	for (int i = 0; i < thresh_num[x_id]; i++)
-		thresh[x_id * (CU_Params[0].numTresholds + 1) + i] += curand_uniform(&state) *
-		(thresh[x_id * (CU_Params[0].numTresholds + 1) + i + 1] - thresh[x_id * (CU_Params[0].numTresholds + 1) + i]);
-
-	// ===== Dynamic Parallelism: compute historgram across samples =====
-	int blk_genStat = (int)ceil(sh[0] * 1.0 / default_block_X);
-	parstat_gen << < blk_genStat, default_block_X >> >(&cu_response_array[x_id * sh[0]], labs, sap_ID, sh[0], thresh_num[x_id], &thresh[x_id * (CU_Params[0].numTresholds + 1)], &parstat[x_id * (CU_Params[0].numTresholds + 1) * CU_Params[0].numLabels]);
-	cucheck_dev(cudaGetLastError());
-	// ===== Dynamic Parallelism: compute gain across threshold candidates =====
-	int blk_genGain = (int)ceil(thresh_num[x_id] * 1.0 / default_block_X);
-	gain_gen << < blk_genGain, default_block_X >> > (&gain[x_id * (CU_Params[0].numTresholds + 1)], &parstat[x_id * (CU_Params[0].numTresholds + 1) * CU_Params[0].numLabels], thresh_num[x_id], par_entropy);
-	cucheck_dev(cudaGetLastError());
-}
-
-#endif
-
-// ========================================= New Kernels ================================================
-
-__global__ void kernel_compute_response_batch(
-	int			valid_images,
-	int*		cu_depthID,
-	int*		sequence,
-	int2*		cu_coords,
-	float*		cu_depth_array,
-	float*		cu_response_array,
-	float4*		cu_features
-	)
-{
-	// Copy valid_images into shared memory
-	__shared__ int shared_sampleNum[1];
-	if (threadIdx.x == 0) {
-		shared_sampleNum[0] = valid_images * SAMPLE_PER_IMAGE;
-	}
-	__syncthreads();
-
-	// Get the operation position of current thread
-	const int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-
-	// Determine feature and sample index from the x_id
-	const int sample_id  = x_id % (PROCESS_LIMIT * SAMPLE_PER_IMAGE);
-	const int feature_id = x_id / (PROCESS_LIMIT * SAMPLE_PER_IMAGE);
-
-	// Structure of response array: 
-	// Feature1: sap1, sap2, ... Feature2: sap1, sap2, ... Feature n
-	if (feature_id >= CU_Params[0].numFeatures || sample_id >= shared_sampleNum[0]) {
-		return;
-	}
-
-	float depth = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] +		// Offset to the start of the depth image
-			      cu_coords[sample_id].y * const_DP_Info[1] +					// Offset to the start of the corresponding row
-		          cu_coords[sample_id].x];										// Offset to the exact depth info
-
-	// Handle the case when depth is zero
-	if (depth == 0.0) {
-		cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = -10000.0;
-		return;
-	}
-
-	// Calculate responses
-	float x = cu_features[feature_id].x / depth + cu_coords[sample_id].x;
-	float y = cu_features[feature_id].y / depth + cu_coords[sample_id].y;
-
-	x = (x < 0) ? 0 :
-		(x >= const_DP_Info[1]) ? const_DP_Info[1] - 1 : x;
-	y = (y < 0) ? 0 :
-		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
-
-	float depth2 = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-	x = cu_features[feature_id].z / depth + cu_coords[sample_id].x;
-	y = cu_features[feature_id].w / depth + cu_coords[sample_id].y;
-
-	x = (x < 0) ? 0 :
-		(x >= const_DP_Info[1]) ? const_DP_Info[1] - 1 : x;
-	y = (y < 0) ? 0 :
-		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
-
-	// ##### The curand causes memory issues ##### //
-	//curandState state;
-	//curand_init(clock(), x_id, 0, &state);
-	//if (round(curand_uniform(&state)) == 1)
-	//{
-	//	cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = depth2 - depth;
-	//}
-	//else
-	//{
-	//	float depth3 = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-	//	cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = depth2 - depth3;
-	//}
-	// ########################################### //
-
-	cu_response_array[feature_id * CU_Params[0].sample_per_tree + sequence[sample_id]] = depth2 - depth;
-}
-
-__global__ void kernel_compute_response(
-	int2*	cu_coords,
-	int*	cu_depthID,
-	float*	cu_depth_array,
-	int*	sample_ID,
-	float4* cu_features,
-	float*	cu_response_array
-	)
-{
-	// Structure of response array: 
-	// Feature1: sap1, sap2, ... Feature2: sap1, sap2, ... Feature n
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= const_UT_Info[0]) 
-	{
-		return;
-	}
-
-	const int sample_id		= x_id % CU_Params[0].sample_per_tree;
-	const int feature_id	= x_id / CU_Params[0].sample_per_tree;
-
-	float depth = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] +			// Offset to the start of the depth image
-				  cu_coords[sample_id].y * const_DP_Info[1] +						// Offset to the start of the corresponding row
-				  cu_coords[sample_id].x];											// Offset to the exact depth info
-
-	// Handle the case when depth is zero
-	if (depth == 0.0) {
-		cu_response_array[x_id] = -10000.0;
-		return;
-	}
-
-	// Calculate responses
-	float x		= cu_features[feature_id].x / depth + cu_coords[sample_id].x;
-	float y		= cu_features[feature_id].y / depth + cu_coords[sample_id].y;
-
-	x = (x < 0) ? 0 :
-		(x >= const_DP_Info[1]) ? const_DP_Info[1] - 1 : x;
-	y = (y < 0) ? 0 :
-		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
-
-	float depth2	= cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-	x				= cu_features[feature_id].z / depth + cu_coords[sample_id].x;
-	y				= cu_features[feature_id].w / depth + cu_coords[sample_id].y;
-
-	x = (x < 0) ? 0 :
-		(x >= const_DP_Info[1]) ? const_DP_Info[1] - 1 : x;
-	y = (y < 0) ? 0 :
-		(y >= const_DP_Info[2]) ? const_DP_Info[2] - 1 : y;
-
-	// ##### The curand causes memory issues ##### //
-	//curandState state;
-	//curand_init(clock(), x_id, 0, &state);
-	//if (round(curand_uniform(&state)) == 1)
-	//{
-	//	cu_response_array[x_id] = depth2 - depth;
-	//}
-	//else
-	//{
-	//	float depth3 = cu_depth_array[cu_depthID[sample_id] * const_DP_Info[3] + int(y) * const_DP_Info[1] + int(x)];
-	//	cu_response_array[x_id] = depth2 - depth3;
-	//}
-	// ########################################### //
-
-	cu_response_array[x_id] = depth2 - depth;
-}
-
-__global__ void kernel_compute_gain(
-	float*				gain,
-	int*				thresh_num,
-	float				parent_entropy,
-	unsigned int*		left_statistics,
-	unsigned int*		right_statistics,
-	unsigned int*		partition_statistics
-	)
-{
-	// Get the thread index
-	const int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-
-	// Abort thread if the thread is out of boundary
-	if (x_id >= (CU_Params[0].numTresholds + 1) * CU_Params[0].numFeatures) {
-		return;
-	}
-
-	// Calculate the feature and threshold index
-	const int feature_id		= x_id / (CU_Params[0].numTresholds + 1);								 // Index of the feature
-	const int thresh_id			= x_id % (CU_Params[0].numTresholds + 1);								 // Index of the threshold
-	const int thresh_number		= thresh_num[feature_id];												 // Retrieve the number of thresholds for this feature
-	const int feature_offset	= feature_id * (CU_Params[0].numTresholds + 1) * CU_Params[0].numLabels; // Calculate feature offset
-
-	// Abort thread if the threshold exceeds current total number of thresholds
-	if (thresh_id >= thresh_number) {
-		return;
-	}
-
-	unsigned int  left_counter	  = 0;
-	unsigned int  right_counter	  = 0;
-	// Aggregate histograms into left and right statistics
-	for (int p = 0; p < thresh_number + 1; p++) {
-		if (p <= thresh_id) {
-			for (int i = 0; i < CU_Params[0].numLabels; i++) {
-				left_statistics[feature_offset + thresh_id * CU_Params[0].numLabels + i] += 
-					partition_statistics[feature_offset + p * CU_Params[0].numLabels + i];
-			}
-		}
-		else {
-			for (int i = 0; i < CU_Params[0].numLabels; i++) {
-				right_statistics[feature_offset + thresh_id * CU_Params[0].numLabels + i] += 
-					partition_statistics[feature_offset + p * CU_Params[0].numLabels + i];
-			}
-		}
-	}
-
-	for (int i = 0; i < CU_Params[0].numLabels; i++) {
-		left_counter	+= left_statistics[feature_offset + thresh_id * CU_Params[0].numLabels + i];
-		right_counter	+= right_statistics[feature_offset + thresh_id * CU_Params[0].numLabels + i];
-	}
-
-	// Calculate gain for the current threshold
-	if ((left_counter + right_counter) <= 1) {
-		gain[feature_id * (CU_Params[0].numTresholds + 1) + thresh_id] = 0.0;
-	}
-	else {
-		gain[feature_id * (CU_Params[0].numTresholds + 1) + thresh_id] =
-			parent_entropy - (left_counter * entropy_gain(&left_statistics[feature_offset + thresh_id * CU_Params[0].numLabels], left_counter)
-			+ right_counter * entropy_gain(&right_statistics[feature_offset + thresh_id * CU_Params[0].numLabels], right_counter) ) / (left_counter + right_counter);
-	}
-}
-
-__global__ void kernel_compute_partitionStatistics(
-	float*			response,
-	float*			thresh,
-	int*			labels,
-	int*			thresh_num,
-	int*			sample_ID,
-	int				start_index,
-	int				sample_num,
-	unsigned int*	partition_statistics
-	)
-{
-	// Copy number of samples into shared memory
-	__shared__ int shared_sample_num[1];
-	if (threadIdx.x == 0) {
-		shared_sample_num[0] = sample_num;
-	}
-	__syncthreads();
-
-	// Decide if the thread is out of boundary
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= shared_sample_num[0] * CU_Params[0].numFeatures) {
-		return;
-	}
-
-	// Decide the feature index and relative sample index
-	const int feature_id	= x_id / shared_sample_num[0];
-	const int rel_sample_id = x_id % shared_sample_num[0];
-	const int thresh_number = thresh_num[feature_id];
-
-	// Put the sample label into right bin
-	int b = 0;
-	while (
-		b < thresh_number &&
-		response[feature_id * CU_Params[0].sample_per_tree + sample_ID[start_index + rel_sample_id]] // Retrieve the response
-		>= thresh[feature_id * (CU_Params[0].numTresholds + 1) + b]								     // Retrieve the thresholds
-		)							 
-		b++;
-
-	// Add one to the corresponding histogram
-	atomicAdd(
-		&partition_statistics[feature_id * (CU_Params[0].numTresholds + 1) * CU_Params[0].numLabels // Offset to the start of the feature
-		+ b * CU_Params[0].numLabels																// Offset to the start of the threshold
-		+ labels[sample_ID[start_index + rel_sample_id]]],											// Offset to the bin
-		1
-		);
-}
-
-__global__ void kernel_generate_thresholds(
-	float*	response,
-	int*	thresh_num,
-	float*	thresh,
-	int*	sample_ID,
-	int		start_index,
-	int		sample_num
-	)
-{
-	// Copy number of samples into shared memory
-	__shared__ int shared_sample_num[1];
-	if (threadIdx.x == 0) {
-		shared_sample_num[0] = sample_num;
-	}
-	__syncthreads();
-
-	// Decide if the thread is out of boundary
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= CU_Params[0].numFeatures) {
-		return;
-	}
-
-	// Generate thresholds for each of the features
-	curandState state;
-	curand_init(clock(), x_id, 0, &state);
-	const int numThresholds = CU_Params[0].numTresholds;
-	if (shared_sample_num[0] > numThresholds) {
-
-		thresh_num[x_id] = numThresholds;
-		for (int i = 0; i < numThresholds + 1; i++) {
-			int randIdx = round(curand_uniform(&state) * (shared_sample_num[0] - 1));
-			thresh[x_id * (numThresholds + 1) + i] = response[x_id * CU_Params[0].sample_per_tree + sample_ID[start_index + randIdx]];
-		}
-	}
-	else {
-		thresh_num[x_id] = shared_sample_num[0] - 1;
-		for (int i = 0; i < shared_sample_num[0]; i++ ) {
-			thresh[x_id * (numThresholds + 1) + i] = response[x_id * CU_Params[0].sample_per_tree + sample_ID[start_index + i]];
-		}
-	}
-
-	// Sort the generated thresholds
-	thrust::sort(thrust::seq, &thresh[x_id * (numThresholds + 1)], &thresh[x_id * (numThresholds + 1)] + thresh_num[x_id] + 1);
-
-	// Decide the validity of the thresholds
-	if (thresh[x_id * (numThresholds + 1)] == thresh[x_id * (numThresholds + 1) + thresh_num[x_id]]) {
-		thresh_num[x_id] = 0;
-		return;
-	}
-
-	for (int i = 0; i < thresh_num[x_id]; i++) {
-		int difference = curand_uniform(&state) * (thresh[x_id * (numThresholds + 1) + i + 1] -
-						 thresh[x_id * (numThresholds + 1) + i]);
-		thresh[x_id * (numThresholds + 1) + i] += difference;
-	}
-}
-
 // ========================================= Class Methods ================================================
 
-bool RDF_CU::shouldTerminate(float maxGain, int recurseDepth)
+CUDA_TRAIN::CUDA_TRAIN(
+	const int	numTrees_,
+	const int	numImages_,
+	const int	numPerTree_,
+	const int	maxDepth_,
+	const int	numSamples_,
+	const int	numLabels_,
+	const int	maxSpan_,
+	const int	spaceSize_,
+	const int	numFeatures_,
+	const int	numThresholds_,
+	boost::shared_ptr<std::vector<std::vector<rdf::Sample> > > samples_,
+	const bool	createCUContext_
+	) :
+	createCUContext(createCUContext_)
 {
-	return (maxGain < Thres || recurseDepth >= params.maxDepth);
-}
+	// Create CUDA context for the program
+	if (createCUContext) {
+		createCuContext(false);
+	}
 
-void RDF_CU::setParam(RDF_CU_Param& params_)
-{
-	params = params_;
+	// Check the validity of the inputs
+	assert(numTrees_ > 0);
+	int num_per_tree = (*samples_)[0].size();
+	assert(num_per_tree > 0);
+
+	for (int i = 0; i < numTrees_; i++) {
+		assert((*samples_)[i].size() == num_per_tree);
+	}
+
+	// Initialize RDF forest parameters
+	params.numTrees			= numTrees_;
+	params.numImages		= numImages_;
+	params.numPerTree		= numPerTree_;
+	params.maxDepth			= maxDepth_;
+	params.numSamples		= numSamples_;
+	params.numLabels		= numLabels_ + 1;
+	params.maxSpan			= maxSpan_;
+	params.spaceSize		= spaceSize_;
+	params.numFeatures		= numFeatures_;
+	params.numThresholds	= numThresholds_;
+	params.sample_per_tree	= (*samples_)[0].size();
+
+	// Determine the width and height of the depth images
+	width		= (*samples_)[0][0].getDepth().cols;
+	height		= (*samples_)[0][0].getDepth().rows;
+	depth_num	= numPerTree_;
+
+	// Prepare for depth and other information in host
+	int host_DP_Info[DPInfoCount] = { depth_num, width, height, width * height };
+	int host_UT_Info[UTInfoCount] = { params.sample_per_tree * numFeatures_ };
+
+	// Upload information to device constant memory
+	const_DP_Info_upload(host_DP_Info);
+	const_UT_Info_upload(host_UT_Info);
 
 	// Copy parameters into constant memory
-	cudaMemcpyToSymbol(CU_Params, &params, sizeof(RDF_CU_Param));
+	const_CU_Params_upload(&params);
 
-	return;
+	// Initialize the forest to be trained
+	forest = new rdf::Forest();
+
+	// Initialize the log space for feature generation
+	logSpace.initialize(maxSpan_, spaceSize_);
+
+	// Initialize device memory
+	cu_initialize();
 }
 
-void RDF_CU::cu_free()
+CUDA_TRAIN::~CUDA_TRAIN()
+{
+	// Free all device memory
+	cu_deviceMemFree();
+
+	// Free all host memory
+	cu_hostMemFree();
+
+	// Reset device
+	if (createCUContext) {
+		destroyCuContext();
+	}
+}
+
+void CUDA_TRAIN::cu_deviceMemFree()
 {
 	// Synchronize device
 	gpuErrchk(cudaDeviceSynchronize());
@@ -774,7 +284,10 @@ void RDF_CU::cu_free()
 	gpuErrchk(cudaFree(cu_thresh_num));
 	gpuErrchk(cudaFree(cu_thresh));
 	gpuErrchk(cudaFree(cu_gain));
+}
 
+void CUDA_TRAIN::cu_hostMemFree()
+{
 	// clean up CPU memory
 	delete[] parentStatistics;
 
@@ -783,8 +296,13 @@ void RDF_CU::cu_free()
 	host_response_array.clear();
 }
 
+bool CUDA_TRAIN::shouldTerminate(float maxGain, int recurseDepth)
+{
+	return (maxGain < Thres || recurseDepth >= params.maxDepth);
+}
+
 // Compute entropy on the give statistics
-float RDF_CU::entropy_compute(unsigned int* stat, int boundary)
+float CUDA_TRAIN::entropy_compute(unsigned int* stat, int boundary)
 {
 	int cntr = 0;
 	for (int i = 0; i < boundary; i++)
@@ -801,7 +319,7 @@ float RDF_CU::entropy_compute(unsigned int* stat, int boundary)
 	return res;
 }
 
-void RDF_CU::cu_initialize()
+void CUDA_TRAIN::cu_initialize()
 {
 	const int numFeatures   = params.numFeatures;
 	const int samplePerTree = params.sample_per_tree;
@@ -809,8 +327,8 @@ void RDF_CU::cu_initialize()
 	// Constant GPU Memory
 	const int thresh_num_size	= numFeatures * sizeof(int);
 	const int feature_size		= numFeatures * sizeof(float4);
-	const int thresh_size		= (params.numTresholds + 1) * numFeatures * sizeof(float);
-	const int parstat_size		= params.numLabels * (params.numTresholds + 1) * numFeatures * sizeof(unsigned int);
+	const int thresh_size		= (params.numThresholds + 1) * numFeatures * sizeof(float);
+	const int parstat_size		= params.numLabels * (params.numThresholds + 1) * numFeatures * sizeof(unsigned int);
 	
 	gpuErrchk(cudaMalloc((void**)&cu_features,				feature_size));
 	gpuErrchk(cudaMalloc((void**)&cu_partitionStatistics,	parstat_size));
@@ -856,7 +374,7 @@ void RDF_CU::cu_initialize()
 	nodes_size = (1 << params.maxDepth) - 1;
 }
 
-void RDF_CU::cu_reset()
+void CUDA_TRAIN::cu_reset()
 {
 	const int numFeatures	= params.numFeatures;
 	const int samplePerTree = params.sample_per_tree;
@@ -908,146 +426,23 @@ void RDF_CU::cu_reset()
 	gpuErrchk(cudaDeviceSynchronize());
 }
 
-void RDF_CU::cu_depth_const_upload(int depth_image_num, int width_, int height_)
+void CUDA_TRAIN::compute_responses(std::vector<rdf::Sample>& samples_per_tree)
 {
-	// Basic depth information
-	depth_num	= depth_image_num;
-	width		= width_;
-	height		= height_;
+	// Generate a set of features for the current tree
+	float4* host_features = new float4[params.numFeatures];
 
-	// copy depth information into constant memory
-	int host_DP_Info[DPInfoCount] = { depth_num, width, height, width * height };
-	cudaMemcpyToSymbol(const_DP_Info, host_DP_Info, sizeof(int) * DPInfoCount);
-
-	// copy other information into constant memory
-	int host_UT_Info[UTInfoCount] = { params.sample_per_tree * params.numFeatures };
-	cudaMemcpyToSymbol(const_UT_Info, host_UT_Info, sizeof(int) * UTInfoCount);
-}
-
-#ifdef ENABLE_GPU_OBSOLETE
-
-void RDF_CU::cu_init(int2* sample_coords, int* sample_labels, int* sample_depID, float4* features)
-{
-	const int numFeatures	= params.numFeatures;
-	const int samplePerTree = params.sample_per_tree;
-
-	int feature_size		= numFeatures * sizeof(float4);
-	int coords_size			= samplePerTree * sizeof(int2);
-	int labels_size			= samplePerTree * sizeof(int);
-	int thresh_num_size		= numFeatures * sizeof(int);
-	int response_size		= samplePerTree * numFeatures * sizeof(float);
-	int thresh_size			= (params.numTresholds + 1) * numFeatures * sizeof(float);
-	int parstat_size		= params.numLabels * (params.numTresholds + 1) * numFeatures * sizeof(size_t);
-
-	// Declare CUDA Memory
-	cudaMalloc((void**)&cu_coords, coords_size);
-	cudaMalloc((void**)&cu_sapID, labels_size);
-	cudaMalloc((void**)&cu_labels, labels_size);
-	cudaMalloc((void**)&cu_depID, labels_size);
-	cudaMalloc((void**)&cu_features, feature_size);
-	cudaMalloc((void**)&cu_response_array, response_size);
-	cudaMalloc((void**)&cu_partitionStatistics, parstat_size);
-	cudaMalloc((void**)&cu_thresh_num, thresh_num_size);
-	cudaMalloc((void**)&cu_thresh, thresh_size);
-	cudaMalloc((void**)&cu_gain, thresh_size);
-
-	// Declare CPU Memory
-	parentStatistics = new size_t[params.numLabels];
-
-	// Copy to Constant GPU Memory
-	// cudaMemcpyToSymbol(CU_Params, &params, sizeof(RDF_CU_Param));
-
-	// Copy to GPU Memory
-	cudaMemcpy(cu_coords, sample_coords, coords_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(cu_labels, sample_labels, labels_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(cu_depID, sample_depID, labels_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(cu_features, features, feature_size, cudaMemcpyHostToDevice);
-
-	// Copy to CPU Memory
-	host_labels = thrust::host_vector<int>(sample_labels, sample_labels + samplePerTree);
-
-	// Call CUDA kernel to initialize Sample ID on Device
-	int blk_sapIDIni = (int)ceil(params.sample_per_tree * 1.0 / default_block_X);
-	sapID_ini << <blk_sapIDIni, default_block_X >> >(cu_sapID);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
-
-	// Initialize Sample ID on Host
-	host_sapID.reserve(samplePerTree);
-	for (int i = 0; i < samplePerTree; i++) {
-		host_sapID[i] = i;
+	for (int i = 0; i < params.numFeatures; i++) {
+		rdf::Feature feat(logSpace);
+		host_features[i].x = feat.getX();
+		host_features[i].y = feat.getY();
+		host_features[i].z = feat.getXX();
+		host_features[i].w = feat.getYY();
 	}
-	nodes_size = (1 << params.maxDepth) - 1;
 
-	//CU_MemChecker();
-}
-
-void RDF_CU::cu_dataTransfer(int2* sample_coords, int* sample_labels, int* sample_depID, float4* features)
-{
-	const int numFeatures	= params.numFeatures;
-	const int samplePerTree = params.sample_per_tree;
-
-	int labels_size		= samplePerTree * sizeof(int);
-	int coords_size		= samplePerTree * sizeof(int2);
-	int feature_size	= numFeatures * sizeof(float4);
-
-	// Copy to GPU Memory
-	cudaMemcpy(cu_coords,	sample_coords,	coords_size,	cudaMemcpyHostToDevice);
-	cudaMemcpy(cu_labels,	sample_labels,	labels_size,	cudaMemcpyHostToDevice);
-	cudaMemcpy(cu_depID,	sample_depID,	labels_size,	cudaMemcpyHostToDevice);
-	cudaMemcpy(cu_features, features,		feature_size,	cudaMemcpyHostToDevice);
-
-	// Copy to CPU Memory
-	host_labels = thrust::host_vector<int>(sample_labels, sample_labels + samplePerTree);
-}
-
-void RDF_CU::cu_depthTransfer(float* depth_array)
-{
-	// Copy depth information into constant memory
-	int depth_array_size = depth_num * width * height * sizeof(float);
-	cudaMemcpy(cu_depth_array, depth_array, depth_array_size, cudaMemcpyHostToDevice);
-}
-
-void RDF_CU::cu_depth_init(int depth_image_num, int width_, int height_, float* depth_array)
-{
-	// Basic depth information
-	depth_num	= depth_image_num;
-	width		= width_;
-	height		= height_;
-
-	// Copy depth information into constant memory
-	int depth_array_size = depth_num * width * height * sizeof(float);
-	int host_DP_Info[DPInfoCount] = { depth_num, width, height, width * height };
-	cudaMemcpyToSymbol(const_DP_Info, host_DP_Info, sizeof(int) * DPInfoCount);
-
-	// Copy other information into constant memory
-	int host_UT_Info[UTInfoCount] = { params.sample_per_tree * params.numFeatures };
-	cudaMemcpyToSymbol(const_UT_Info, host_UT_Info, sizeof(int) * UTInfoCount);
-
-	// Allocate memory and copy depth into global memory
-	cudaMalloc((void**)&cu_depth_array, depth_array_size);
-	cudaMemcpy(cu_depth_array, depth_array, depth_array_size, cudaMemcpyHostToDevice);
-
-	//CU_MemChecker();
-}
-
-void RDF_CU::host_free()
-{
-	host_labels.clear();
-	host_sapID.clear();
-	host_response_array.clear();
-}
-
-#endif
-
-void RDF_CU::cu_featureTransfer(float4 *features_)
-{
+	// Copy features into device memory
 	const int feature_size = params.numFeatures * sizeof(float4);
-	cudaMemcpy(cu_features, features_, feature_size, cudaMemcpyHostToDevice);
-}
+	cudaMemcpy(cu_features, host_features, feature_size, cudaMemcpyHostToDevice);
 
-void RDF_CU::compute_responses(std::vector<rdf::Sample>& samples_per_tree)
-{
 	const int numImages			= params.numPerTree;
 	const int samplesPerImage	= params.numSamples;
 	const int totalSamples		= samples_per_tree.size();
@@ -1183,11 +578,37 @@ void RDF_CU::compute_responses(std::vector<rdf::Sample>& samples_per_tree)
 	delete[] host_sequence;
 	delete[] host_coords;
 	delete[] host_depth;
+	delete[] host_features;
 
 	copied_indicator.clear();
 }
 
-void RDF_CU::cu_train(std::vector<rdf::Node>& nodes)
+rdf::Forest* CUDA_TRAIN::cu_startTrain(boost::shared_ptr<std::vector<std::vector<rdf::Sample>>> samples_)
+{
+	// Start training the forest
+	for (int t = 0; t < params.numTrees; t++) {
+
+		// Timing each tree
+		clock_t tree_start = clock();
+
+		rdf::Tree tree(params.maxDepth);
+		cu_reset();
+		compute_responses((*samples_)[t]);
+		cu_train(tree.getNodes());
+		cudaDeviceSynchronize();
+
+		clock_t tree_end = clock();
+		float tree_time = (float)(tree_end - tree_start) / CLOCKS_PER_SEC;
+		printf("Tree %d complete: %f seconds\n", t, tree_time);
+
+		// Add tree to the forest
+		forest->addTree(tree);
+	}
+
+	return forest;
+}
+
+void CUDA_TRAIN::cu_train(std::vector<rdf::Node>& nodes)
 {
 	// ===== Initialization =====
 	std::vector<int> idx(1);
@@ -1212,7 +633,7 @@ void RDF_CU::cu_train(std::vector<rdf::Node>& nodes)
 	idx_E.clear();
 }
 
-void RDF_CU::cu_trainLevel(
+void CUDA_TRAIN::cu_trainLevel(
 	std::vector<int>&		idx,
 	std::vector<int>&		idx_S,
 	std::vector<int>&		idx_E,
@@ -1226,8 +647,8 @@ void RDF_CU::cu_trainLevel(
 
 	// ===== Calculate array sizes =====
 	int		size_thresh_num  = params.numFeatures * sizeof(int);
-	int		size_thresh		 = (params.numTresholds + 1) * params.numFeatures * sizeof(float);
-	int		size_parstat	 = params.numLabels * (params.numTresholds + 1) * params.numFeatures * sizeof(unsigned int);
+	int		size_thresh		 = (params.numThresholds + 1) * params.numFeatures * sizeof(float);
+	int		size_parstat	 = params.numLabels * (params.numThresholds + 1) * params.numFeatures * sizeof(unsigned int);
 
 	for (int i = 0; i < nodesCurrentLevel; i++) {
 
@@ -1288,7 +709,7 @@ void RDF_CU::cu_trainLevel(
 		gpuErrchk(cudaDeviceSynchronize());
 
 		// Call CUDA kernel to compute gain for each of the thresholds
-		int blkSet_compute_gain = (int)ceil(params.numFeatures * (params.numTresholds + 1) * 1.0 / default_block_X);
+		int blkSet_compute_gain = (int)ceil(params.numFeatures * (params.numThresholds + 1) * 1.0 / default_block_X);
 		kernel_compute_gain << <blkSet_compute_gain, default_block_X >> > (
 			cu_gain,
 			cu_thresh_num,
@@ -1301,11 +722,11 @@ void RDF_CU::cu_trainLevel(
 		gpuErrchk(cudaDeviceSynchronize());
 
 		// Sort the computed gains and find the best feature and best threshold
-		thrust::device_vector<float> thrust_gain(cu_gain, cu_gain + (params.numTresholds + 1) * params.numFeatures);
+		thrust::device_vector<float> thrust_gain(cu_gain, cu_gain + (params.numThresholds + 1) * params.numFeatures);
 		thrust::device_vector<float>::iterator iter = thrust::max_element(thrust_gain.begin(), thrust_gain.end());
 		float		 max_gain			= *iter;
 		unsigned int position			= iter - thrust_gain.begin();
-		int			 best_feature_idx	= position / (params.numTresholds + 1);
+		int			 best_feature_idx	= position / (params.numThresholds + 1);
 
 		// Decide the status of current node and abort if necessary
 		if (max_gain == 0.0 || shouldTerminate(max_gain, recurseDepth)) {
@@ -1398,287 +819,60 @@ void RDF_CU::cu_trainLevel(
 	cudaMemcpy(cu_sapID, host_sapID.data(), params.sample_per_tree * sizeof(int), cudaMemcpyHostToDevice);
 }
 
+int CUDA_TRAIN::getWidth()
+{
+	return width;
+}
+
+int CUDA_TRAIN::getHeight()
+{
+	return height;
+}
+
+int CUDA_TRAIN::getNumTrees()
+{
+	return params.numTrees;
+}
+
+int CUDA_TRAIN::getNumLabels()
+{
+	return params.numLabels;
+}
+
+int CUDA_TRAIN::getMaxDepth()
+{
+	return params.maxDepth;
+}
+
 // ================================================================================================================
 // ============================================= INFERENCE ========================================================
 // ================================================================================================================
 
-#define DepthInfoCount_Inf 3
-
 #define MAX_PARALLEL_IMG 4
 
-#define TREE_CONTAINER_SIZE	3
-
-// Declare constant memory
-__constant__ int	const_Depth_Info_Inf[DepthInfoCount_Inf];
-
-__constant__ int	const_numTrees_Inf[1];								// Number of trees
-
-__constant__ int	const_numLabels_Inf[1];								// Number of labels
-
-__constant__ int	const_maxDepth_Inf[1];								// Max depth
-
-__constant__ int	const_labelIndex_Inf[1];							// Label index
-
-__constant__ float	const_minProb_Inf[1];								// Min probability
-
-__constant__ int	const_totalNode_Inf[1];								// Total number of nodes in the forest
-
-__constant__ int	const_treePartition_Inf[TREE_CONTAINER_SIZE + 1];	// Store the ACCUMULATIVE offsets of each starting index
-
 // ================== Inference Kernels with Forest in shared memory ==================
-
-extern __shared__ Node_CU forest_shared[];
-
-__global__ void kernel_inference_ForestInShared(
-	float*		depth,
-	int3*		rgb,
-	Node_CU*	forest,
-	int			parallel_depth_img
-	)
-{
-	// Copy forest into the shared memory
-	if (threadIdx.x < const_totalNode_Inf[0]) {
-		forest_shared[threadIdx.x] = forest[threadIdx.x];
-	}
-	__syncthreads();
-
-	// Decide if the thread is out of boundary
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= parallel_depth_img * const_Depth_Info_Inf[2]) {
-		return;
-	}
-
-	// Decide the basic information of the thread
-	const int depth_idx = x_id / const_Depth_Info_Inf[2];											// Get the index of depth image
-	const int y_coord	= (x_id - const_Depth_Info_Inf[2] * depth_idx) / const_Depth_Info_Inf[0];	// Get the row of the sample
-	const int x_coord	= (x_id - const_Depth_Info_Inf[2] * depth_idx) % const_Depth_Info_Inf[0];	// Get the column of the sample
-
-	// Declare the probability array for the forest
-	float prob[NODE_NUM_LABELS] = { 0 };
-
-	// Initialize the pixel of the output
-	rgb[x_id].x = 0;
-	rgb[x_id].y = 0;
-	rgb[x_id].z = 0;
-
-	// ===== Calculate response =====
-	const float depth_local = depth[x_id];
-
-	// Handle the case when depth is zero
-	if (depth_local == 0.0) {
-		return;
-	}
-
-	// ===== Go through the forest =====
-	for (int i = 0; i < const_numTrees_Inf[0]; i++) {
-		// ===== Go through each tree =====
-		unsigned int idx = const_treePartition_Inf[i];
-
-		while (forest_shared[idx].isSplit == 1) {
-
-			// Calculate responses
-			float x = forest_shared[idx].feature.x / depth_local + x_coord;
-			float y = forest_shared[idx].feature.y / depth_local + y_coord;
-
-			x = (x < 0) ? 0 :
-				(x >= const_Depth_Info_Inf[0]) ? const_Depth_Info_Inf[0] - 1 : x;
-
-			y = (y < 0) ? 0 :
-				(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
-
-			float depth2	= depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
-
-			// Calculate the response of the second set of offsets, disabled
-			//x				= forest_shared[idx].feature.z / depth_local + x_coord;
-			//y				= forest_shared[idx].feature.w / depth_local + y_coord;
-
-			//x = (x < 0) ? 0 :
-			//	(x >= const_Depth_Info_Inf[0]) ? const_Depth_Info_Inf[0] - 1 : x;
-			//
-			//y = (y < 0) ? 0 :
-			//	(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
-
-			// ##### The curand causes memory issues ##### //
-			// float response;
-			//curandState_t state;
-			//curand_init(clock(), x_id, 0, &state);
-			//if (round(curand_uniform(&state)) == 1) {
-			//	response = depth2 - depth_local;
-			//}
-			//else {
-				//response = depth2 - depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
-			//}
-			// ########################################### //
-
-			float response = depth2 - depth_local;
-			// ============================
-
-			// Decide which branch to goto
-			if (response < forest_shared[idx].threshold) {
-				idx = const_treePartition_Inf[i] + forest_shared[idx].leftChild;	// Goto left branch
-			}
-			else { 
-				idx = const_treePartition_Inf[i] + forest_shared[idx].rightChild;	// Goto right branch
-			}
-		}
-
-		// Decide if the tree is valid
-		if (forest_shared[idx].isSplit != 0) {
-			printf("Error: non leaf node reached ...\n");
-			return;
-		}
-		
-		// Retrieve aggregator and calculate probabilities
-		int sampleCount = 0;
-		for (int j = 0; j < NODE_NUM_LABELS; j++) {
-			sampleCount += forest_shared[idx].aggregator[j];
-		}
-
-		for (int j = 0; j < NODE_NUM_LABELS; j++) {
-			prob[j] += forest_shared[idx].aggregator[j] * 1.0 / (sampleCount * const_numTrees_Inf[0]);
-		}
-	}
-
-	// Decide the label of the pixel
-	if (prob[const_labelIndex_Inf[0]] > const_minProb_Inf[0]) {
-		switch (2 - const_labelIndex_Inf[0]) {
-		case 0: rgb[x_id].x = 255; break;
-		case 1: rgb[x_id].y = 255; break;
-		case 2: rgb[x_id].z = 255; break;
-		default: printf("Error: color decision error ...");
-		}
-	}
-}
-
-// ================== Inference Kernels with Forest in global memory ==================
-
-__global__ void kernel_inference_ForestInGlobal(
-	float*		depth,
-	int3*		rgb,
-	Node_CU*	forest,
-	int			parallel_depth_img
-	)
-{
-	// Decide if the thread is out of boundary
-	int x_id = threadIdx.x + blockDim.x * blockIdx.x;
-	if (x_id >= parallel_depth_img * const_Depth_Info_Inf[2]) {
-		return;
-	}
-
-	// Decide the basic information of the thread
-	const int depth_idx = x_id / const_Depth_Info_Inf[2];											// Get the index of depth image
-	const int y_coord   = (x_id - const_Depth_Info_Inf[2] * depth_idx) / const_Depth_Info_Inf[0];	// Get the row of the sample
-	const int x_coord   = (x_id - const_Depth_Info_Inf[2] * depth_idx) % const_Depth_Info_Inf[0];	// Get the column of the sample
-
-	// Declare the probability array for the forest
-	float prob[NODE_NUM_LABELS] = { 0 };
-
-	// Initialize the pixel of the output
-	rgb[x_id].x = 0;
-	rgb[x_id].y = 0;
-	rgb[x_id].z = 0;
-
-	// ===== Calculate response =====
-	const float depth_local = depth[x_id];
-
-	// Handle the case when depth is zero
-	if (depth_local == 0.0) {
-		return;
-	}
-
-	// ===== Go through the forest =====
-	for (int i = 0; i < const_numTrees_Inf[0]; i++) {
-		// ===== Go through each tree =====
-		unsigned int idx = const_treePartition_Inf[i];
-
-		while (forest[idx].isSplit == 1) {
-
-			// Calculate responses
-			float x = forest[idx].feature.x / depth_local + x_coord;
-			float y = forest[idx].feature.y / depth_local + y_coord;
-
-			x = (x < 0) ? 0 :
-				(x >= const_Depth_Info_Inf[0]) ? const_Depth_Info_Inf[0] - 1 : x;
-
-			y = (y < 0) ? 0 :
-				(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
-
-			float depth2 = depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
-
-			// Calculate the response of the second set of offsets, disabled
-			//x = forest[idx].feature.z / depth_local + x_coord;
-			//y = forest[idx].feature.w / depth_local + y_coord;
-
-			//x = (x < 0) ? 0 :
-			//	(x >= const_Depth_Info_Inf[0]) ? const_Depth_Info_Inf[0] - 1 : x;
-
-			//y = (y < 0) ? 0 :
-			//	(y >= const_Depth_Info_Inf[1]) ? const_Depth_Info_Inf[1] - 1 : y;
-
-			// ##### The curand causes memory issues ##### //
-			//float response;
-			//curandState state;
-			//curand_init(clock(), x_id, 0, &state);
-			//if (round(curand_uniform(&state)) == 1) {
-			//	response = depth2 - depth_local;
-			//}
-			//else {
-			//	response = depth2 - depth[depth_idx * const_Depth_Info_Inf[2] + int(y) * const_Depth_Info_Inf[0] + int(x)];
-			//}
-			// ########################################### //
-
-			float response = depth2 - depth_local;
-			// ============================
-
-			// Decide which branch to goto
-			if (response < forest[idx].threshold) {
-				idx = const_treePartition_Inf[i] + forest[idx].leftChild;	// Goto left branch
-			}
-			else {
-				idx = const_treePartition_Inf[i] + forest[idx].rightChild;	// Goto right branch
-			}
-		}
-
-		// Decide if the tree is valid
-		if (forest[idx].isSplit != 0) {
-			printf("Error: non leaf node reached ...\n");
-			return;
-		}
-
-		// Retrieve aggregator and calculate probabilities
-		int sampleCount = 0;
-		for (int j = 0; j < NODE_NUM_LABELS; j++) {
-			sampleCount += forest[idx].aggregator[j];
-		}
-
-		for (int j = 0; j < NODE_NUM_LABELS; j++) {
-			prob[j] += forest[idx].aggregator[j] * 1.0 / (sampleCount * const_numTrees_Inf[0]);
-		}
-	}
-
-	// Decide the label of the pixel
-	if (prob[const_labelIndex_Inf[0]] > const_minProb_Inf[0]) {
-		switch (2 - const_labelIndex_Inf[0]) {
-		case 0: rgb[x_id].x = 255; break;
-		case 1: rgb[x_id].y = 255; break;
-		case 2: rgb[x_id].z = 255; break;
-		default: printf("Error: color decision error ...");
-		}
-	}
-}
 
 CUDA_INFER::CUDA_INFER(
 	const int							parallel_proc_,
 	const int							depth_width_,
 	const int							depth_height_,
+	const int							numTrees_,
+	const int							numLabels_,
+	const int							maxDepth_,
+	const float							minProb_,
 	const bool							createCUContext_,
-	std::vector<std::vector<Node_CU>>&	forest_,
 	const bool							realTime_,
-	std::string							out_directory_
+	const std::string					in_directory_,
+	const std::string					out_directory_
 	) :
 	parallel_proc	(parallel_proc_),
 	depth_width		(depth_width_),
 	depth_height	(depth_height_),
+	numTrees		(numTrees_),
+	numLabels		(numLabels_ + 1),
+	maxDepth		(maxDepth_),
+	minProb			(minProb_),
+	in_directory	(in_directory_),
 	createCUContext (createCUContext_),
 	depthArray_size	(parallel_proc_ * depth_width_ * depth_height_ * sizeof(float)),
 	rgbArray_size	(parallel_proc_ * depth_width_ * depth_height_ * sizeof(int3)),
@@ -1691,8 +885,20 @@ CUDA_INFER::CUDA_INFER(
 		createCuContext(false);
 	}
 
+	// Determine if the given number of labels matches the program setting
+	if (numLabels != NODE_NUM_LABELS) {
+		printf("Error: the number of labels is fixed ...\n");
+		exit(-1);
+	}
+
+	// Read in forest from file
+	readForest();
+
+	// Upload tree information to constant memory
+	cu_upload_TreeInfo();
+
 	// Determine if to put forest in shared memory
-	const int node_num = cu_ifInShared(forest_);
+	const int node_num = cu_ifInShared();
 
 	// Upload depth information to constant memory
 	upload_DepthInfo_Inf(depth_width_, depth_height_);
@@ -1742,9 +948,9 @@ CUDA_INFER::CUDA_INFER(
 
 	// Copy forest into host array
 	int cntr = 0;
-	for (int i = 0; i < forest_.size(); i++) {
-		for (int j = 0; j < forest_[i].size(); j++) {
-			host_forest[cntr++] = forest_[i][j];
+	for (int i = 0; i < forest_CU.size(); i++) {
+		for (int j = 0; j < forest_CU[i].size(); j++) {
+			host_forest[cntr++] = forest_CU[i][j];
 		}
 	}
 	assert(cntr == node_num);
@@ -1755,9 +961,124 @@ CUDA_INFER::CUDA_INFER(
 	// Decide if to output results
 	writeOut = (out_directory == "") ? false : true;
 	if (writeOut) {
-		out = boost::filesystem::path(out_directory);
-		if (!boost::filesystem::exists(out)) {
-			boost::filesystem::create_directory(out);
+		out_path = boost::filesystem::path(out_directory);
+		if (!boost::filesystem::exists(out_path)) {
+			boost::filesystem::create_directory(out_path);
+		}
+	}
+
+	// Free host forest immediately for performance purpose
+	free(host_forest);
+}
+
+CUDA_INFER::CUDA_INFER(
+	const int							parallel_proc_,
+	CUDA_TRAIN&							cuda_train,
+	const float							minProb_,
+	const bool							createCUContext_,
+	const bool							realTime_,
+	const std::string					in_directory_,
+	const std::string					out_directory_
+	) :
+	parallel_proc	(parallel_proc_),
+	depth_width		(cuda_train.getWidth()),
+	depth_height	(cuda_train.getHeight()),
+	numTrees		(cuda_train.getNumTrees()),
+	numLabels		(cuda_train.getNumLabels()),
+	maxDepth		(cuda_train.getMaxDepth()),
+	minProb			(minProb_),
+	in_directory	(in_directory_),
+	createCUContext	(createCUContext_),
+	depthArray_size	(parallel_proc_ * depth_width * depth_height * sizeof(float)),
+	rgbArray_size	(parallel_proc_ * depth_width * depth_height * sizeof(int3)),
+	out_directory	(out_directory_),
+	realTime		(realTime_),
+	firstFrame		(true)
+{
+	// Create CUDA context for the program
+	if (createCUContext) {
+		createCuContext(false);
+	}
+
+	// Determine if the given number of labels matches the program setting
+	if (numLabels != NODE_NUM_LABELS) {
+		printf("Error: the number of labels is fixed ...\n");
+		exit(-1);
+	}
+
+	// Read in forest from file
+	readForest();
+
+	// Upload tree information to constant memory
+	cu_upload_TreeInfo();
+
+	// Determine if to put forest in shared memory
+	const int node_num = cu_ifInShared();
+
+	// Upload depth information to constant memory
+	upload_DepthInfo_Inf(depth_width, depth_height);
+
+	// Calculate the kernel launch parameters
+	blk_Inference = (int)ceil(depth_width * depth_height * parallel_proc_ * 1.0f / default_block_X);
+
+	frame_cntr = 0;								// Set the frame counter to zero
+
+	// Allocate device memory
+	gpuErrchk(cudaMalloc(&device_depthArray1, depthArray_size));
+	gpuErrchk(cudaMalloc(&device_rgbArray1, rgbArray_size));
+	gpuErrchk(cudaMalloc(&device_forest, forest_size));
+
+	// Initialize device memory
+	gpuErrchk(cudaMemset(device_depthArray1, 0, depthArray_size));
+	gpuErrchk(cudaMemset(device_rgbArray1, 0, rgbArray_size));
+
+	// Allocate the host output array
+	host_rgbArray1 = new int3[depth_width * depth_height];
+
+	// Initialize host array
+	memset(host_rgbArray1, 0, depth_width * depth_height * sizeof(int3));
+
+	if (!realTime) {
+		// Allocate device memory
+		gpuErrchk(cudaMalloc(&device_depthArray2, depthArray_size));
+		gpuErrchk(cudaMalloc(&device_rgbArray2, rgbArray_size));
+
+		// Initialize device memory
+		gpuErrchk(cudaMemset(device_depthArray2, 0, depthArray_size));
+		gpuErrchk(cudaMemset(device_rgbArray2, 0, rgbArray_size));
+
+		// Create cuda streams
+		gpuErrchk(cudaStreamCreate(&execStream));
+		gpuErrchk(cudaStreamCreate(&copyStream));
+
+		// Allocate the host output array
+		host_rgbArray2 = new int3[depth_width * depth_height];
+
+		// Initialize host array
+		memset(host_rgbArray2, 0, depth_width * depth_height * sizeof(int3));
+	}
+
+	// Prepare host forest
+	host_forest = new Node_CU[node_num];
+
+	// Copy forest into host array
+	int cntr = 0;
+	for (int i = 0; i < forest_CU.size(); i++) {
+		for (int j = 0; j < forest_CU[i].size(); j++) {
+			host_forest[cntr++] = forest_CU[i][j];
+		}
+	}
+	assert(cntr == node_num);
+
+	// Synchronously copy forest into device memory
+	cudaMemcpy(device_forest, host_forest, forest_size, cudaMemcpyHostToDevice);
+
+	// Decide if to output results
+	writeOut = (out_directory == "") ? false : true;
+	if (writeOut) {
+		out_path = boost::filesystem::path(out_directory);
+		if (!boost::filesystem::exists(out_path)) {
+			boost::filesystem::create_directory(out_path);
 		}
 	}
 
@@ -1779,68 +1100,155 @@ CUDA_INFER::~CUDA_INFER()
 	}
 }
 
+void CUDA_INFER::readForest()
+{
+	in_path = boost::filesystem::path(in_directory);
+	boost::filesystem::ifstream in(in_path);
+
+	forest_CU.resize(numTrees);
+	const int treeSize = (1 << maxDepth) - 1;
+
+	// Declare to hold input values
+	int				intValue;
+	unsigned int	uintValue;
+	float			floatValue;
+
+	for (size_t i = 0; i < numTrees; i++) {
+		int node_counter = 0;
+		std::vector<Node_CU>& nodes_CU = forest_CU[i];
+		std::vector<unsigned int> parent_pointer(treeSize, -1);
+
+		for (size_t j = 0; j < treeSize; j++) {
+			in >> intValue;
+			int label = intValue;
+
+			// Split node
+			if (label == 1) {
+				in >> uintValue;
+				unsigned int idx = uintValue;
+
+				// Indicate the true position in the array
+				parent_pointer[idx] = node_counter++;
+
+				// Initialize a split CUDA node and push back
+				Node_CU node_operation;
+				node_operation.isSplit = 1;
+				in >> node_operation.feature.x;			// x of feature
+				in >> node_operation.feature.y;			// y of feature
+				node_operation.feature.z = 0.0;			// No value set
+				node_operation.feature.w = 0.0;			// No value set
+				in >> node_operation.threshold;			// Threshold
+				for (unsigned int k = 0; k < NODE_NUM_LABELS; k++) {
+					node_operation.aggregator[k] = 0;
+				}
+				node_operation.leftChild = -1;
+				node_operation.rightChild = -1;
+
+				// Push current node into the vector
+				nodes_CU.push_back(node_operation);
+
+				if (idx == 0) {
+					continue;
+				}
+
+				// Set left and right child indicator of parent node
+				(idx % 2 != 0) ?
+					nodes_CU[parent_pointer[(idx - 1) / 2]].leftChild  = node_counter - 1 :
+					nodes_CU[parent_pointer[(idx - 2) / 2]].rightChild = node_counter - 1;
+			}
+
+			// Leaf node
+			else if (label == 0) {
+				in >> uintValue;
+				unsigned int idx = uintValue;
+
+				// Indicate the true position in the array
+				parent_pointer[idx] = node_counter++;
+
+				// Initialize a leaf CUDA node and push back
+				Node_CU node_operation;
+				node_operation.isSplit = 0;
+				node_operation.feature.x = 0.0;
+				node_operation.feature.y = 0.0;
+				node_operation.feature.z = 0.0;
+				node_operation.feature.w = 0.0;
+				node_operation.threshold = 0.0;
+
+				in >> uintValue;
+				for (unsigned int k = 0; k < NODE_NUM_LABELS; k++) {
+					in >> node_operation.aggregator[k];
+				}
+
+				node_operation.leftChild = -1;
+				node_operation.rightChild = -1;
+
+				// Push current node into the vector
+				nodes_CU.push_back(node_operation);
+
+				if (idx == 0) {
+					continue;
+				}
+
+				// Set left and right child indicator of parent node
+				(idx % 2 != 0) ?
+					nodes_CU[parent_pointer[(idx - 1) / 2]].leftChild = node_counter - 1 :
+					nodes_CU[parent_pointer[(idx - 2) / 2]].rightChild = node_counter - 1;
+			}
+		}
+	}
+
+	in.close();
+}
+
 void CUDA_INFER::upload_DepthInfo_Inf(
 	int width_,
 	int height_
 	)
 {
 	int host_DepthInfo_Inf[DepthInfoCount_Inf] = { width_, height_, width_ * height_ };
-	cudaMemcpyToSymbol(const_Depth_Info_Inf, host_DepthInfo_Inf, sizeof(int) * DepthInfoCount_Inf);
+	const_DepthInfo_Inf_upload(host_DepthInfo_Inf);
 }
 
-void CUDA_INFER::cu_upload_TreeInfo(
-	int									numLabels_,
-	int									maxDepth_,
-	float								minProb_,
-	std::vector<std::vector<Node_CU>>&	forest_
-	)
+void CUDA_INFER::cu_upload_TreeInfo()
 {
 	// Assuming forest contains correct number of trees, MIGHT BE RISKY
-	int numTrees_	= forest_.size();
+	int numTrees_	= forest_CU.size();
 
 	// Assuming 0 for labelIndex_, MIGHT BE RISKY
 	int	labelIndex_ = 0;
 
 	// Determine if the input number of trees exceed the partition container limit
 	if (numTrees_ > TREE_CONTAINER_SIZE) {
-		printf("Error: size of tree partition container is hardcoded ...\n");
+		printf("Error: size of tree partition container is fixed ...\n");
 		exit(-1);
 	}
 
-	numLabels_ = numLabels_ + 1;
-
-	// Determine if the given number of labels matches the program setting
-	if (numLabels_ != NODE_NUM_LABELS) {
-		printf("Error: the number of labels is hardcoded ...\n");
-		exit(-1);
-	}
-
-	cudaMemcpyToSymbol(const_numTrees_Inf, &numTrees_, sizeof(int));
-	cudaMemcpyToSymbol(const_numLabels_Inf, &numLabels_, sizeof(int));
-	cudaMemcpyToSymbol(const_maxDepth_Inf, &maxDepth_, sizeof(int));
-	cudaMemcpyToSymbol(const_labelIndex_Inf, &labelIndex_, sizeof(int));
-	cudaMemcpyToSymbol(const_minProb_Inf, &minProb_, sizeof(float));
+	const_numTrees_Inf_upload(&numTrees_);
+	const_numLabels_Inf_upload(&numLabels);
+	const_maxDepth_Inf_upload(&maxDepth);
+	const_labelIndex_Inf_upload(&labelIndex_);
+	const_minProb_Inf_upload(&minProb);
 
 	// Upload trees partition information to constant memory
 	int host_total_nodeNum = 0;
 	int host_partitionInfo[TREE_CONTAINER_SIZE + 1] = { 0 };
 	for (int i = 0; i < numTrees_; i++) {
-		host_partitionInfo[i + 1] = forest_[i].size() + host_partitionInfo[i];
-		host_total_nodeNum += forest_[i].size();
+		host_partitionInfo[i + 1] = forest_CU[i].size() + host_partitionInfo[i];
+		host_total_nodeNum += forest_CU[i].size();
 	}
-	cudaMemcpyToSymbol(const_totalNode_Inf, &host_total_nodeNum, sizeof(int));
-	cudaMemcpyToSymbol(const_treePartition_Inf, host_partitionInfo, sizeof(int) * (TREE_CONTAINER_SIZE + 1));
+	const_totalNode_Inf_upload(&host_total_nodeNum);
+	const_treePartition_Inf_upload(host_partitionInfo);
 }
 
-int CUDA_INFER::cu_ifInShared(std::vector<std::vector<Node_CU>>& forest_)
+int CUDA_INFER::cu_ifInShared()
 {
 	// Default value
 	forestInSharedMem = false;
 
 	// Calculate the total number of bytes of the forest
 	int node_num = 0;
-	for (int i = 0; i < forest_.size(); i++) {
-		node_num += forest_[i].size();
+	for (int i = 0; i < forest_CU.size(); i++) {
+		node_num += forest_CU[i].size();
 	}
 
 	forest_size = node_num * sizeof(Node_CU);
@@ -1968,7 +1376,7 @@ cv::Mat_<cv::Vec3i> CUDA_INFER::cu_inferFrame_hard(const cv::Mat_<float>& depth_
 	gpuErrchk(cudaDeviceSynchronize());
 
 	// Copy rgb from device to host
-	cudaMemcpy(host_rgbArray1, device_rgbArray1, depthArray_size, cudaMemcpyDeviceToHost);
+	cudaMemcpy(host_rgbArray1, device_rgbArray1, rgbArray_size, cudaMemcpyDeviceToHost);
 
 	// Copy the array into a mat structure
 	cv::Mat_<cv::Vec3i> result(depth_height, depth_width, (cv::Vec3i*)host_rgbArray1);
@@ -2055,13 +1463,13 @@ void CUDA_INFER::writeResult(const cv::Mat_<cv::Vec3i>& result)
 		}
 
 		// Assemble names
-		out_rgb = out / (fmt_result_rgb % std::to_string(frame_cntr - 3)).str();
+		out_rgb = out_path / (fmt_result_rgb % std::to_string(frame_cntr - 3)).str();
 	}
 
 	// For batch outputs, three frames lag but better performance
 	else {
 
-		out_rgb = out / (fmt_result_rgb % std::to_string(frame_cntr)).str();
+		out_rgb = out_path / (fmt_result_rgb % std::to_string(frame_cntr)).str();
 	}
 
 	// Write out results
@@ -2073,7 +1481,7 @@ void CUDA_INFER::writeResult(const std::vector<cv::Mat_<cv::Vec3i>>& result)
 	for (int i = 0; i < 3; i++) {
 		// Assemble names
 		boost::format fmt_result_rgb("%s_result_rgb.png");
-		boost::filesystem::path out_rgb = out / (fmt_result_rgb % std::to_string(frame_cntr - (3 - i))).str();
+		boost::filesystem::path out_rgb = out_path / (fmt_result_rgb % std::to_string(frame_cntr - (3 - i))).str();
 
 		// Write out results
 		cv::imwrite(out_rgb.string(), result[i]);

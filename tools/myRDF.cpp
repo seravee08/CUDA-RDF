@@ -22,17 +22,18 @@
 #include <boost/format.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
+#include <boost/make_shared.hpp>
 
 #include <google/protobuf/text_format.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
-//#include <glog/logging.h>
+
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <io.h>
 #include <stdio.h>
-#include "RDF_CU.cuh"
+#include <RDF_CU.cuh>
 
 using namespace std;
 using google::protobuf::Message;
@@ -363,8 +364,14 @@ int train() {
 
 
 	rdf::RDFPtr rdf = boost::make_shared<rdf::RDF>(samples);
-	rdf->initialize_cu(maxSpan, spaceSize, numLabels + 1, numFeatures, numThresholds, numTrees, maxDepth, numSamples, numImages, numPerTree);
-	rdf::ForestPtr forest = rdf->trainForest(maxDepth);
+	// rdf->initialize_cu(maxSpan, spaceSize, numLabels + 1, numFeatures, numThresholds, numTrees, maxDepth, numSamples, numImages, numPerTree);
+	// rdf::ForestPtr forest = rdf->trainForest(maxDepth);
+
+	// ===== GPU RDF Training =====
+	CUDA_TRAIN cu_train(numTrees, numImages, numPerTree, maxDepth, numSamples, numLabels, maxSpan, spaceSize, numFeatures, numThresholds, samples, true);
+	rdf::Forest* forest = cu_train.cu_startTrain(samples);
+
+	// ============================
 
 	std::cout << "Training complete!" <<std::endl;
 	now = std::chrono::system_clock::now();
@@ -424,27 +431,22 @@ int test() {
 		readFiles(io_, all_depth_paths, depth_, rgb_, idx);
 	}
 
-	// ===== Load trained forest =====
-	std::vector<std::vector<Node_CU> > forest_CU(numTrees);
-	std::string fp = rdfParam.out_name();
-	boost::filesystem::path fin(fp);
-	rdf::Forest forest_(numTrees, maxDepth);
-	forest_.readForest(fin, numLabels + 1, forest_CU);
-
 	// =========================== GPU Branch =============================== //
 #ifdef USE_GPU_INFERENCE
+
+	const int depth_width  = depth_[0].getDepth().cols;
+	const int depth_height = depth_[0].getDepth().rows;
 
 	clock_t inference_start_GPU = clock();
 
 	// ===== GPU Inference =====
-	CUDA_INFER cu_infer(1, depth_[0].getDepth().cols, depth_[0].getDepth().rows, true, forest_CU, true, rdfParam.test_output_path());
-	cu_infer.cu_upload_TreeInfo(numLabels, maxDepth, min_prob, forest_CU);
+	CUDA_INFER cu_infer(1, depth_width, depth_height, numTrees, numLabels, maxDepth, min_prob, true, true, rdfParam.out_name(), rdfParam.test_output_path());
 
 	for (int i = 0; i < depth_.size(); i++) {
 		cu_infer.cu_inferFrame_hard(depth_[i].getDepth());
 	}
 
-	// Optional
+	// Used on when in non real time mode
 	// cu_infer.flushOutLastThree();
 	// =========================
 
@@ -457,6 +459,13 @@ int test() {
 #else
 
 	// =========================== CPU Branch =============================== //
+
+	// ===== Load trained forest =====
+	std::string fp = rdfParam.out_name();
+	boost::filesystem::path fin(fp);
+	rdf::Forest forest_(numTrees, maxDepth);
+	forest_.readForest(fin, numLabels + 1);
+
 	std::vector<cv::Mat_<int> > masks;
 
 	masks.resize(num);
@@ -558,10 +567,10 @@ int main(int argc, char** argv){
 	//	std::cout << "Should have at least one option!" << std::endl;
 	//}
 
-	createCuContext(false);
+	// createCuContext(false);
 	train();
 	// test();
-	destroyCuContext();
+	// destroyCuContext();
 
 	system("pause");
 

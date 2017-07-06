@@ -8,7 +8,6 @@
 #include <rdf/aggregator.hpp>
 #include <rdf/feature.hpp>
 #include <rdf/logSpace.hpp>
-#include "RDF_CU.cuh"
 
 namespace rdf {
 
@@ -17,7 +16,7 @@ namespace rdf {
         RDF(boost::shared_ptr<std::vector<std::vector<rdf::Sample> > > samples);
         ~RDF() {}
 
-		rdf::Tree trainTree(const int& idx, const int& maxDepth, RDF_CU& rdf_cu);
+		rdf::Tree trainTree(const int& idx, const int& maxDepth);
         rdf::ForestPtr trainForest(const int& maxDepth);
         void reset(const int& idx);
         void initialize(const int& maxSpan, 
@@ -52,34 +51,6 @@ namespace rdf {
                                       const unsigned int& idx_dataE,
                                       const float* response,
                                       std::vector<float>& thresholds);
-
-		//void cu_params_copy(
-		//	std::vector<rdf::Sample>&	samples_per_tree,
-		//	RDF_CU&						rdf_cu
-		//	);
-
-		//void cu_data_copy(
-		//	std::vector<rdf::Sample>& samples_per_tree,
-		//	RDF_CU& rdf_cu
-		//	);
-
-		void cu_copy_features(
-			RDF_CU& rdf_cu
-			);
-
-		//void copyDepthInfo(
-		//	std::vector<rdf::Sample>&	samples_per_tree,
-		//	RDF_CU&						rdf_cu
-		//	);
-
-		void generateFeatures(
-			float4	*features,
-			int		featureNum
-			);
-
-		void cu_treeIndependent_paramsUpload(
-			RDF_CU& rdf_cu
-			);
 
         double computeGain() const;    
 

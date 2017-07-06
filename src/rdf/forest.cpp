@@ -1,5 +1,11 @@
 #include <rdf/forest.hpp>
 
+#include <boost/format.hpp>
+#include <boost/filesystem/fstream.hpp>
+
+#include <rdf/aggregator.hpp>
+#include <rdf/sample.hpp>
+
 namespace rdf{
 	
 	Forest::Forest() {
@@ -69,8 +75,7 @@ namespace rdf{
 
     void Forest::readForest(
 		const boost::filesystem::path& path,
-		const int& numLabels,
-		std::vector<std::vector<Node_CU> >& forest_CU
+		const int& numLabels
 		) 
 	{
         boost::filesystem::ifstream in(path);
@@ -80,12 +85,6 @@ namespace rdf{
             int intValue;
             unsigned int uintValue;
             float floatValue;
-			
-#ifdef USE_GPU_INFERENCE
-			int node_counter = 0;
-			std::vector<Node_CU>& nodes_CU = forest_CU[i];
-			std::vector<unsigned int> parent_pointer(nodes.size(), -1);
-#endif
 
             for(unsigned int j = 0; j < nodes.size(); j++){
                 in >> intValue;
@@ -106,37 +105,6 @@ namespace rdf{
                     in >> floatValue;
                     nodes[idx].initializeSplit(feature, floatValue, idx);
 
-#ifdef USE_GPU_INFERENCE
-					// Indicate the true position in the array
-					parent_pointer[idx] = node_counter++;
-
-					// Initialize a split CUDA node and push back
-					Node_CU node_operation;
-					node_operation.isSplit		= 1;
-					node_operation.feature.x	= feature.getX();	// x of feature
-					node_operation.feature.y	= feature.getY();	// y of feature
-					node_operation.feature.z	= 0.0;				// No value set
-					node_operation.feature.w	= 0.0;				// No value set
-					node_operation.threshold	= floatValue;		// Threshold
-					for (unsigned int k = 0; k < NODE_NUM_LABELS; k++) {
-						node_operation.aggregator[k] = 0;
-					}
-					node_operation.leftChild	= -1;
-					node_operation.rightChild	= -1;
-
-					// Push current node into the vector
-					nodes_CU.push_back(node_operation);
-
-					if (idx == 0) {
-						continue;
-					}
-
-					// Set left and right child indicator of parent node
-					(idx % 2 != 0) ?
-						nodes_CU[parent_pointer[(idx - 1) / 2]].leftChild	= node_counter - 1:
-						nodes_CU[parent_pointer[(idx - 2) / 2]].rightChild	= node_counter - 1;
-#endif
-
                 }
                 //leaf node
 				else if (label == 0) {
@@ -152,37 +120,6 @@ namespace rdf{
 						trainingStatistics.setBin(k, uintValue);
 					}
 					nodes[idx].initializeLeaf(trainingStatistics, idx);
-
-#ifdef USE_GPU_INFERENCE
-					// Indicate the true position in the array
-					parent_pointer[idx] = node_counter++;
-
-					// Initialize a leaf CUDA node and push back
-					Node_CU node_operation;
-					node_operation.isSplit		= 0;
-					node_operation.feature.x	= 0.0;
-					node_operation.feature.y	= 0.0;
-					node_operation.feature.z	= 0.0;
-					node_operation.feature.w	= 0.0;
-					node_operation.threshold	= 0.0;
-					for (unsigned int k = 0; k < NODE_NUM_LABELS; k++) {
-						node_operation.aggregator[k] = trainingStatistics.samplePerBin(k);
-					}
-					node_operation.leftChild	= -1;
-					node_operation.rightChild	= -1;
-
-					// Push current node into the vector
-					nodes_CU.push_back(node_operation);
-
-					if (idx == 0) {
-						continue;
-					}
-
-					// Set left and right child indicator of parent node
-					(idx % 2 != 0) ?
-						nodes_CU[parent_pointer[(idx - 1) / 2]].leftChild	= node_counter - 1 :
-						nodes_CU[parent_pointer[(idx - 2) / 2]].rightChild	= node_counter - 1;
-#endif
 				}
             }
         }

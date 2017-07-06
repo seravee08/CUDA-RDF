@@ -284,26 +284,17 @@ namespace rdf{
 	}
 
 
-	rdf::Tree RDF::trainTree(const int& idx, const int& maxDepth, RDF_CU& rdf_cu){
+	rdf::Tree RDF::trainTree(const int& idx, const int& maxDepth){
 
 		clock_t start = clock();
 		rdf::Tree tree(maxDepth);
 
-#ifdef USE_GPU_TRAINING
-		// ===== CUDA Call =====
-		rdf_cu.cu_reset();
-		cu_copy_features(rdf_cu);
-		rdf_cu.compute_responses((*samples_)[idx]);
-		rdf_cu.cu_train(tree.getNodes());
-		cudaDeviceSynchronize();
-#else
 		// ===== CPU Version =====
 		rdf::Feature* const_Features = new rdf::Feature[numOfCandidateFeatures_];
 		for (int i = 0; i < numOfCandidateFeatures_; i++) {
 			const_Features[i] = rdf::Feature(space_);
 		}
 		trainNodesRecurse(tree.getNodes(), 0, 0, (*samples_)[idx].size(), 0, idx, const_Features);
-#endif
 
 		clock_t end = clock();
 		float time = (float)(end - start) / CLOCKS_PER_SEC;
@@ -314,19 +305,10 @@ namespace rdf{
 
 	rdf::ForestPtr RDF::trainForest(const int& maxDepth){
 
-		RDF_CU rdf_cu;
-
-#ifdef USE_GPU_TRAINING
-
-		// Upload constant parameters and initialize for GPU
-		cu_treeIndependent_paramsUpload(rdf_cu);
-		rdf_cu.cu_initialize();
-#endif
-
 		rdf::ForestPtr forest = boost::make_shared<rdf::Forest>();
 		for (int t = 0; t < numOfTrees_; t++) {
 			reset(t);
-			rdf::Tree tree = trainTree(t, maxDepth, rdf_cu);
+			rdf::Tree tree = trainTree(t, maxDepth);
 			forest->addTree(tree);
 
 			std::cout << "Tree " << t + 1 << " complete!" << std::endl;
@@ -335,219 +317,6 @@ namespace rdf{
 			//std::cout << std::put_time(std::localtime(&now_c), "%c") << std::endl;
 		}
 
-#ifdef USE_GPU_TRAINING
-
-		// Manually call to free gpu and cpu memory
-		rdf_cu.cu_free();
-#endif
 		return forest;
 	}
-
-	void RDF::cu_treeIndependent_paramsUpload(RDF_CU& rdf_cu)
-	{
-		// Check the validity of the samples
-		assert(numOfTrees_ > 0);
-
-		int num_per_tree = (*samples_)[0].size();
-
-		assert(num_per_tree > 0);
-
-		for (int i = 0; i < numOfTrees_; i++) {
-			assert((*samples_)[i].size() == num_per_tree);
-		}
-
-		// Initialize RDF Parameter
-		RDF_CU_Param host_rdf_param;
-		host_rdf_param.numTrees			= numOfTrees_;							// Number of trees
-		host_rdf_param.numImages		= numImages_;							// Number of images
-		host_rdf_param.numPerTree		= numPerTree_;							// Number of images per tree
-		host_rdf_param.maxDepth			= maxDecisionLevels_;
-		host_rdf_param.numSamples		= numSamples_;
-		host_rdf_param.numLabels		= numOfLabels_;
-		host_rdf_param.maxSpan			= maxSpan_;
-		host_rdf_param.spaceSize		= spaceSize_;
-		host_rdf_param.numFeatures		= numOfCandidateFeatures_;
-		host_rdf_param.numTresholds		= numOfCandidateThresholdsPerFeature_;
-		host_rdf_param.sample_per_tree	= num_per_tree;							// Number of samples per tree !
-
-		// Determine the width and height of the depth images
-		const int width  = (*samples_)[0][0].getDepth().cols;
-		const int height = (*samples_)[0][0].getDepth().rows;
-
-		// Upload tree independent parameters to constant memory
-		rdf_cu.setParam(host_rdf_param);
-		rdf_cu.cu_depth_const_upload(numPerTree_, width, height);
-	}
-
-	void RDF::cu_copy_features(RDF_CU& rdf_cu)
-	{
-		float4 *features = new float4[numOfCandidateFeatures_];
-
-		// Generate feature candidates on CPU
-		generateFeatures(features, numOfCandidateFeatures_);
-
-		rdf_cu.cu_featureTransfer(features);
-	}
-
-	void RDF::generateFeatures(float4 *features, int featureNum)
-	{
-		for (int i = 0; i < featureNum; i++) {
-			rdf::Feature tmp(space_);
-			features[i].x = tmp.getX();
-			features[i].y = tmp.getY();
-			features[i].z = tmp.getXX();
-			features[i].w = tmp.getYY();
-		}
-	}
-
-#ifdef ENABLE_GPU_OBSOLETE
-	void RDF::cu_data_copy(std::vector<rdf::Sample>& samples_per_tree, RDF_CU& rdf_cu)
-	{
-		int num_per_tree	= samples_per_tree.size();				// Samples per tree
-		int *sample_labels	= new int[num_per_tree];				// Labels for samples
-		int *sample_depthID = new int[num_per_tree];				// Depth image IDs for samples
-		int2 *sample_coords = new int2[num_per_tree];				// Coordinates for samples
-		float4 *features	= new float4[numOfCandidateFeatures_];	// Features for the tree
-
-		// Decide if the inputs are valid
-		assert(numPerTree_ > 0);
-
-		if (num_per_tree <= 0) {
-			printf("Error: number of samples per tree is less or equal to 0 ...\n");
-			exit(-1);
-		}
-
-		// Retrive information from the samples
-		for (int i = 0; i < num_per_tree; i++)
-		{
-			sample_coords[i].x	= samples_per_tree[i].getCoor().x;
-			sample_coords[i].y	= samples_per_tree[i].getCoor().y;
-			sample_labels[i]	= samples_per_tree[i].getLabel();
-			sample_depthID[i]	= samples_per_tree[i].getDepthID();
-		}
-		
-		// Generate feature candidates on CPU
-		generateFeatures(features, numOfCandidateFeatures_);
-
-		// Data transfer
-		rdf_cu.cu_dataTransfer(sample_coords, sample_labels, sample_depthID, features);
-
-		// Copy depth image into constant memory
-		const int width  = samples_per_tree[0].getDepth().cols;
-		const int height = samples_per_tree[0].getDepth().rows;
-
-		float* worker_array;
-		float* depth_array = new float[numPerTree_ * width * height];
-		std::vector<int> copied_indicator(numPerTree_, 0);
-
-		for (int i = 0; i < num_per_tree; i++) {
-			if (copied_indicator[samples_per_tree[i].getDepthID()] == 1) {
-				continue;
-			}
-			else {
-				copied_indicator[samples_per_tree[i].getDepthID()] = 1;
-				worker_array = (float*)samples_per_tree[i].getDepth().data;
-				std::memcpy(&depth_array[samples_per_tree[i].getDepthID() * width * height], worker_array, width * height * sizeof(float));
-			}
-		}
-
-		rdf_cu.cu_depthTransfer(depth_array);
-
-		// Clean up memory
-		delete[] sample_labels;
-		delete[] sample_depthID;
-		delete[] sample_coords;
-		delete[] features;
-		delete[] depth_array;
-
-		copied_indicator.clear();
-	}
-
-
-	void RDF::cu_params_copy(std::vector<rdf::Sample>& samples_per_tree, RDF_CU& rdf_cu)
-	{
-		int num_per_tree    = samples_per_tree.size();		// Samples per tree
-		int *sample_lables  = new int[num_per_tree];		// Labels for samples
-		int *sample_depthID = new int[num_per_tree];		// Depth image IDs for samples
-		int2 *sample_coords = new int2[num_per_tree];		// Coordinates for samples
-
-		// Decide if the inputs are valid
-		if (num_per_tree <= 0) {
-			printf("Error: number of samples per tree is less or equal to 0 ...\n");
-			exit(-1);
-		}
-
-		// Initialize RDF Parameter
-		RDF_CU_Param host_rdf_param;
-		host_rdf_param.numTrees			= numOfTrees_;								// Number of trees
-		host_rdf_param.numImages		= numImages_;								// Number of images
-		host_rdf_param.numPerTree		= numPerTree_;								// Number of images per tree
-		host_rdf_param.maxDepth			= maxDecisionLevels_;
-		host_rdf_param.numSamples		= numSamples_;
-		host_rdf_param.numLabels		= numOfLabels_;
-		host_rdf_param.maxSpan			= maxSpan_;
-		host_rdf_param.spaceSize		= spaceSize_;
-		host_rdf_param.numFeatures		= numOfCandidateFeatures_;
-		host_rdf_param.numTresholds		= numOfCandidateThresholdsPerFeature_;
-		host_rdf_param.sample_per_tree	= num_per_tree;								// Number of samples per tree !
-
-		rdf_cu.setParam(host_rdf_param);
-
-		// Retrive information from the samples
-		for (int i = 0; i < num_per_tree; i++)
-		{
-			sample_coords[i].x	= samples_per_tree[i].getCoor().x;
-			sample_coords[i].y	= samples_per_tree[i].getCoor().y;
-			sample_lables[i]	= samples_per_tree[i].getLabel();
-			sample_depthID[i]	= samples_per_tree[i].getDepthID();
-		}
-
-		// Generate feature candidates on CPU
-		float4 *features = new float4[numOfCandidateFeatures_];
-		generateFeatures(features, numOfCandidateFeatures_);
-
-		rdf_cu.cu_init(sample_coords, sample_lables, sample_depthID, features);
-
-		// Copy depth image and information into constant memory
-		copyDepthInfo(samples_per_tree, rdf_cu);
-		
-		// Clean up memory
-		free(sample_lables);
-		free(sample_depthID);
-		free(sample_coords);
-		free(features);
-	}
-
-	void RDF::copyDepthInfo(std::vector<rdf::Sample>& samples_per_tree, RDF_CU& rdf_cu)
-	{
-		int sampleNum = samples_per_tree.size();
-
-		assert(sampleNum > 0);
-		assert(numPerTree_ > 0);
-
-		// ==== Determine the width and height of the depth images
-		const int width  = samples_per_tree[0].getDepth().cols;
-		const int height = samples_per_tree[0].getDepth().rows;
-
-		// ==== Copy Depth Image Data to GPU ====
-		float* worker_array;
-		float* depth_array = new float[numPerTree_ * width * height];
-		std::vector<int> copied_indicator(numPerTree_, 0);
-
-		for (int i = 0; i < sampleNum; i++) {
-			if (copied_indicator[samples_per_tree[i].getDepthID()] == 1) {
-				continue;
-			}
-			else {
-				copied_indicator[samples_per_tree[i].getDepthID()] = 1;
-				worker_array = (float*)samples_per_tree[i].getDepth().data;
-				std::memcpy(&depth_array[samples_per_tree[i].getDepthID() * width * height], worker_array, width * height * sizeof(float));
-			}
-		}
-
-		rdf_cu.cu_depth_init(numPerTree_, width, height, depth_array);
-
-		delete[] depth_array;
-	}
-#endif
 }
